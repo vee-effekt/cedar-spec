@@ -108,7 +108,8 @@ impl CedarTestImplementation for CedarCompilerEngine {
         let mut errors = vec![];
 
         // Compile and execute each policy
-        for (policy_id, policy) in policies.policies() {
+        for policy in policies.policies() {
+            let policy_id = policy.id();
             let policy_text = policy.to_string();
 
             // Compile the policy
