@@ -140,6 +140,103 @@ pub fn run_auth_test(
     }
 }
 
+/// Compare the behavior of the authorizer across three implementations:
+/// Rust interpreter, Lean spec, and compiled policies.
+/// Panics if any two do not agree.
+pub fn run_three_way_auth_test(
+    lean_impl: &impl CedarTestImplementation,
+    compiler_impl: &impl CedarTestImplementation,
+    request: &Request,
+    policies: &PolicySet,
+    entities: &Entities,
+) -> Response {
+    let authorizer = Authorizer::new();
+    let (rust_res, rust_auth_dur) =
+        time_function(|| authorizer.is_authorized(request, policies, entities));
+    info!("{}{}", RUST_AUTH_MSG, rust_auth_dur.as_nanos());
+
+    // Get Lean result
+    let lean_res = lean_impl.is_authorized(&request, policies, entities);
+
+    // Get Compiler result
+    let compiler_res = compiler_impl.is_authorized(&request, policies, entities);
+
+    // Helper to convert rust response for comparison
+    let rust_res_for_comparison = |error_mode: ErrorComparisonMode| -> ffi::Response {
+        let errors = match error_mode {
+            ErrorComparisonMode::Ignore => HashSet::new(),
+            ErrorComparisonMode::PolicyIds => rust_res
+                .diagnostics()
+                .errors()
+                .cloned()
+                .map(|err| match err {
+                    AuthorizationError::PolicyEvaluationError(err) => {
+                        ffi::AuthorizationError::new_from_report(
+                            err.policy_id().clone(),
+                            miette!("{}", err.policy_id()),
+                        )
+                    }
+                })
+                .collect(),
+            ErrorComparisonMode::Full => rust_res
+                .diagnostics()
+                .errors()
+                .cloned()
+                .map(Into::into)
+                .collect(),
+        };
+        ffi::Response::new(
+            rust_res.decision(),
+            rust_res.diagnostics().reason().cloned().collect(),
+            errors,
+        )
+    };
+
+    // Compare Rust vs Lean
+    match lean_res {
+        TestResult::Failure(err) => {
+            if !err.contains("unknown extension function") {
+                panic!(
+                    "Lean error for {request}\nPolicies:\n{}\nEntities:\n{}\nError: {err}",
+                    &policies,
+                    &entities.as_ref()
+                );
+            }
+        }
+        TestResult::Success(ref lean_result) => {
+            let rust_cmp = rust_res_for_comparison(lean_impl.error_comparison_mode());
+            assert_eq!(
+                rust_cmp,
+                lean_result.response,
+                "Rust vs Lean mismatch for {request}\nPolicies:\n{policies}\nEntities:\n{}",
+                entities.as_ref()
+            );
+        }
+    }
+
+    // Compare Rust vs Compiler
+    match compiler_res {
+        TestResult::Failure(err) => {
+            panic!(
+                "Compiler error for {request}\nPolicies:\n{}\nEntities:\n{}\nError: {err}",
+                &policies,
+                &entities.as_ref()
+            );
+        }
+        TestResult::Success(compiler_result) => {
+            let rust_cmp = rust_res_for_comparison(compiler_impl.error_comparison_mode());
+            assert_eq!(
+                rust_cmp,
+                compiler_result.response,
+                "Rust vs Compiler mismatch for {request}\nPolicies:\n{policies}\nEntities:\n{}",
+                entities.as_ref()
+            );
+        }
+    }
+
+    rust_res
+}
+
 /// Compare the behavior of the validator in `cedar-policy` against a custom Cedar
 /// implementation. Panics if the two do not agree.
 pub fn run_val_test(
