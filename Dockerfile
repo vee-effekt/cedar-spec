@@ -26,9 +26,9 @@ FROM prepare AS build
 ENV CEDAR_SPEC_ROOT=/opt/src/cedar-spec
 COPY . $CEDAR_SPEC_ROOT
 
-# Clone `cedar` repository
+# Clone `cedar` repository (with PR #1906 merged)
 WORKDIR $CEDAR_SPEC_ROOT
-RUN git clone --depth 1 https://github.com/cedar-policy/cedar
+RUN git clone https://github.com/cedar-policy/cedar && cd cedar && git checkout 09e6690
 
 # Build the Lean formalization and extract to static C libraries
 WORKDIR $CEDAR_SPEC_ROOT/cedar-lean
@@ -37,9 +37,9 @@ RUN source /root/.profile \
   && source ../cedar-drt/set_env_vars.sh \
   && ../cedar-drt/build_lean_lib.sh
 
-# Build DRT
+# Build DRT (limit parallel jobs to avoid OOM)
 WORKDIR $CEDAR_SPEC_ROOT/cedar-drt
-RUN source /root/.profile && source ./set_env_vars.sh && cargo fuzz build -s none
+RUN source /root/.profile && source ./set_env_vars.sh && CARGO_BUILD_JOBS=1 cargo fuzz build -s none
 
 # Initialize corpus for all targets. No-op for target that don't need initilization.
 WORKDIR $CEDAR_SPEC_ROOT/cedar-drt
