@@ -52,6 +52,19 @@ fuzz_target!(|input: FuzzTargetInput<false>| {
 
     for request in requests.iter().cloned() {
         debug!("Request: {request}");
+
+        // Write the test case BEFORE running it, so if it crashes we have it saved
+        let crash_path = std::path::Path::new("fuzz/artifacts/abac-compiler/last_test.txt");
+        if let Some(parent) = crash_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let test_content = format!(
+            "Policy:\n{}\n\nRequest:\n{}\n\nEntities:\n{}\n",
+            policyset, request, input.entities.as_ref()
+        );
+        let _ = std::fs::write(crash_path, test_content);
+
+        // Now run the test
         let (_, total_dur) = time_function(|| {
             run_three_way_auth_test(
                 &lean_engine,

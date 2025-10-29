@@ -119,11 +119,11 @@ impl CedarTestImplementation for CedarCompilerEngine {
                     bytes
                 }
                 Err(err) => {
-                    errors.push(ffi::AuthorizationError::new_from_report(
-                        policy_id.clone(),
-                        miette!("Compilation error: {}", err),
+                    // Compilation failure is a bug in the compiler, not an authorization error
+                    return TestResult::Failure(format!(
+                        "Failed to compile policy {}: {}",
+                        policy_id, err
                     ));
-                    continue;
                 }
             };
 
@@ -150,17 +150,19 @@ impl CedarTestImplementation for CedarCompilerEngine {
                             ));
                         }
                         _ => {
-                            errors.push(ffi::AuthorizationError::new_from_report(
-                                policy_id.clone(),
-                                miette!("Unknown decision value: {}", decision_value),
+                            // Unknown decision value is a compiler bug
+                            return TestResult::Failure(format!(
+                                "Policy {} returned unknown decision value: {}",
+                                policy_id, decision_value
                             ));
                         }
                     }
                 }
                 Err(err) => {
-                    errors.push(ffi::AuthorizationError::new_from_report(
-                        policy_id.clone(),
-                        miette!("Execution error: {}", err),
+                    // Execution failure (e.g., WASM validation error) is a compiler bug
+                    return TestResult::Failure(format!(
+                        "Failed to execute WASM for policy {}: {}",
+                        policy_id, err
                     ));
                 }
             }
