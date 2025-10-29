@@ -74,6 +74,12 @@ test = false
 doc = false
 
 [[bin]]
+name = "abac-compiler"
+path = "fuzz_targets/abac-compiler.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "roundtrip"
 path = "fuzz_targets/roundtrip.rs"
 test = false
