@@ -2,15 +2,25 @@
 """
 LLM-driven Cedar-to-WASM compiler generator.
 
-Uses Gemini 2.5 Flash to iteratively write a Cedar policy compiler,
+Uses an LLM to iteratively write a Cedar policy compiler,
 validated by differential testing against the Cedar Rust interpreter
 and Lean specification.
 
+Supports two providers:
+  - claude: Uses Claude Code CLI (no API key needed, uses Max subscription)
+  - gemini: Uses Gemini 2.5 Flash with free-tier rate limiting
+
 Usage:
-    export GEMINI_API_KEY=your_key_here
+    # With Claude Code (default — uses your Max subscription, no API key)
     python3 llm_compiler.py
-    python3 llm_compiler.py --max-iterations 10 --fuzz-timeout 20
-    python3 llm_compiler.py --build-mode docker --docker-container thia_compiler
+    python3 llm_compiler.py --model claude-sonnet-4-20250514
+
+    # With Gemini (free tier, tracks tokens)
+    export GEMINI_API_KEY=your_key_here
+    python3 llm_compiler.py --provider gemini
+
+    # Manual mode — build+fuzz only, no LLM calls
+    python3 llm_compiler.py --manual
 """
 
 import argparse
@@ -25,10 +35,58 @@ from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
-# Gemini client with token tracking and rate limiting
+# LLM clients
 # ---------------------------------------------------------------------------
 
+class ClaudeCodeClient:
+    """Uses the Claude Code CLI (`claude -p`). No API key needed — uses your
+    Max subscription or whatever auth Claude Code already has."""
+
+    def __init__(self, model: str):
+        # Verify claude CLI is available
+        try:
+            result = subprocess.run(
+                ["claude", "--version"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                print("ERROR: `claude --version` failed.")
+                sys.exit(1)
+        except FileNotFoundError:
+            print("ERROR: `claude` CLI not found. Install Claude Code first.")
+            sys.exit(1)
+
+        self.model = model
+        self.call_count = 0
+
+    def generate(self, system_prompt: str, user_message: str) -> str:
+        """Call Claude Code CLI and return the response text."""
+        self.call_count += 1
+
+        full_prompt = system_prompt + "\n\n" + user_message
+
+        cmd = ["claude", "-p", full_prompt, "--model", self.model]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=300,  # 5 min timeout for long responses
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"claude CLI exited with code {result.returncode}: {result.stderr[:500]}"
+            )
+
+        return result.stdout
+
+    def print_status(self):
+        print(f"  Claude Code calls: {self.call_count}")
+
+
 class GeminiClient:
+    """Gemini client with token tracking and free-tier rate limiting."""
+
     def __init__(self, model: str, max_requests: int):
         try:
             from google import genai
@@ -56,8 +114,8 @@ class GeminiClient:
         self.call_count = 0
         self._last_call_time = 0.0
 
-    def generate(self, system_prompt: str, user_message: str) -> tuple:
-        """Call Gemini and return (response_text, token_info).
+    def generate(self, system_prompt: str, user_message: str) -> str:
+        """Call Gemini and return the response text.
 
         Enforces rate limiting (10 RPM) and request cap.
         """
@@ -91,21 +149,16 @@ class GeminiClient:
         input_tokens = usage.prompt_token_count or 0
         output_tokens = usage.candidates_token_count or 0
         thinking_tokens = getattr(usage, "thinking_token_count", 0) or 0
-        total_tokens = usage.total_token_count or 0
 
         self.total_input_tokens += input_tokens
         self.total_output_tokens += output_tokens
         self.total_thinking_tokens += thinking_tokens
         self.call_count += 1
 
-        token_info = {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "thinking_tokens": thinking_tokens,
-            "total_tokens": total_tokens,
-        }
+        print(f"  Tokens this call: in={input_tokens:,} "
+              f"out={output_tokens:,} thinking={thinking_tokens:,}")
 
-        return response.text, token_info
+        return response.text
 
     def print_status(self):
         print(f"  Requests: {self.call_count}/{self.max_requests} | "
@@ -318,7 +371,7 @@ def extract_fuzz_failure(output: str, cedar_spec_root: Path, mode: str, containe
 # ---------------------------------------------------------------------------
 
 def save_iteration(log_dir: Path, iteration: int, prompt: str, response: str,
-                   parsed: dict, build_output: str, fuzz_output: str, token_info: dict):
+                   parsed: dict, build_output: str, fuzz_output: str):
     """Save all artifacts for one iteration."""
     iter_dir = log_dir / f"iteration_{iteration:03d}"
     iter_dir.mkdir(parents=True, exist_ok=True)
@@ -331,21 +384,21 @@ def save_iteration(log_dir: Path, iteration: int, prompt: str, response: str,
         (iter_dir / "cargo_toml.toml").write_text(parsed["cargo_toml"])
     (iter_dir / "build_output.txt").write_text(build_output)
     (iter_dir / "fuzz_output.txt").write_text(fuzz_output)
-    (iter_dir / "token_info.json").write_text(json.dumps(token_info, indent=2))
 
 
-def save_summary(log_dir: Path, gemini: GeminiClient, final_iteration: int, final_phase: str):
+def save_summary(log_dir: Path, client, final_iteration: int, final_phase: str):
     """Save cumulative summary."""
     summary = {
         "total_iterations": final_iteration,
         "final_phase": final_phase,
-        "total_api_calls": gemini.call_count,
-        "total_input_tokens": gemini.total_input_tokens,
-        "total_output_tokens": gemini.total_output_tokens,
-        "total_thinking_tokens": gemini.total_thinking_tokens,
-        "model": gemini.model,
+        "total_api_calls": client.call_count,
+        "model": client.model,
         "timestamp": datetime.now().isoformat(),
     }
+    # Add token info if available (Gemini)
+    for attr in ("total_input_tokens", "total_output_tokens", "total_thinking_tokens"):
+        if hasattr(client, attr):
+            summary[attr] = getattr(client, attr)
     (log_dir / "summary.json").write_text(json.dumps(summary, indent=2))
 
 
@@ -395,37 +448,74 @@ def build_user_message(phase: str, current_sources: dict, error_context: str) ->
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# Manual mode
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="LLM-driven Cedar-to-WASM compiler generator",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    parser.add_argument("--model", default="gemini-2.5-flash",
-                        help="Gemini model ID")
-    parser.add_argument("--max-iterations", type=int, default=50,
-                        help="Maximum LLM improvement iterations")
-    parser.add_argument("--max-requests", type=int, default=200,
-                        help="Hard stop on API requests (free tier: 250 RPD)")
-    parser.add_argument("--fuzz-timeout", type=int, default=30,
-                        help="Seconds to run the fuzzer per iteration")
-    parser.add_argument("--build-mode", choices=["local", "docker"], default="local",
-                        help="Run cargo builds locally or via docker exec")
-    parser.add_argument("--docker-container", default="thia_compiler",
-                        help="Docker container name (for docker mode)")
-    parser.add_argument("--log-dir", default="./llm_compiler_logs",
-                        help="Directory for per-iteration logs")
-    parser.add_argument("--prompt-file", default="./cedar-policy-compiler/prompt.md",
-                        help="Path to the system prompt file")
-    parser.add_argument("--compiler-dir", default="./cedar-policy-compiler",
-                        help="Path to the compiler crate")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Print full prompts and responses")
-    args = parser.parse_args()
+def run_manual(args):
+    """Manual mode: build + fuzz the current compiler code, print results."""
+    cedar_spec_root = Path(__file__).parent.resolve()
+    compiler_dir = (cedar_spec_root / args.compiler_dir).resolve()
 
-    # Resolve paths
+    print("=" * 70)
+    print("Cedar Compiler — Manual Mode")
+    print("=" * 70)
+    print(f"  Compiler dir: {compiler_dir}")
+    print(f"  Build mode:   {args.build_mode}")
+    print(f"  Fuzz timeout: {args.fuzz_timeout}s")
+    print()
+
+    # Show current source files
+    sources = read_compiler_source(compiler_dir)
+    for filename, content in sorted(sources.items()):
+        lines = content.count("\n")
+        print(f"  {filename}: {lines} lines")
+    print()
+
+    # Docker sync
+    if args.build_mode == "docker":
+        try:
+            sync_to_docker(compiler_dir, args.docker_container)
+            print("  Synced to Docker container.")
+        except subprocess.CalledProcessError as e:
+            print(f"ERROR syncing to Docker: {e}")
+            sys.exit(1)
+
+    # Build
+    print("Building...")
+    build_success, build_output = run_build(
+        cedar_spec_root, args.build_mode, args.docker_container
+    )
+
+    if not build_success:
+        print("BUILD FAILED\n")
+        print(build_output[-4000:])
+        sys.exit(1)
+
+    print("BUILD OK\n")
+
+    # Fuzz
+    print(f"Fuzzing for {args.fuzz_timeout}s...")
+    fuzz_passed, fuzz_output = run_fuzz(
+        cedar_spec_root, args.fuzz_timeout, args.build_mode, args.docker_container
+    )
+
+    if fuzz_passed:
+        print(f"FUZZ PASSED ({args.fuzz_timeout}s)\n")
+        print("The compiler survived the fuzzer. Try increasing --fuzz-timeout")
+        print("for more confidence, or declare victory!")
+        sys.exit(0)
+
+    print("FUZZ FAILED — mismatch found\n")
+    print(fuzz_output)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# Automated mode
+# ---------------------------------------------------------------------------
+
+def run_auto(args):
+    """Automated mode: LLM writes the compiler in a build/fuzz/fix loop."""
     cedar_spec_root = Path(__file__).parent.resolve()
     compiler_dir = (cedar_spec_root / args.compiler_dir).resolve()
     log_dir = (cedar_spec_root / args.log_dir).resolve()
@@ -439,15 +529,18 @@ def main():
         sys.exit(1)
     system_prompt = prompt_file.read_text()
 
-    # Initialize Gemini client
-    gemini = GeminiClient(model=args.model, max_requests=args.max_requests)
+    # Initialize LLM client
+    if args.provider == "claude":
+        client = ClaudeCodeClient(model=args.model)
+    else:
+        client = GeminiClient(model=args.model, max_requests=args.max_requests)
 
     print("=" * 70)
     print("Cedar-to-WASM Compiler Generator")
     print("=" * 70)
+    print(f"  Provider:       {args.provider}")
     print(f"  Model:          {args.model}")
     print(f"  Max iterations: {args.max_iterations}")
-    print(f"  Max requests:   {args.max_requests}")
     print(f"  Fuzz timeout:   {args.fuzz_timeout}s")
     print(f"  Build mode:     {args.build_mode}")
     print(f"  Log dir:        {log_dir}")
@@ -458,8 +551,8 @@ def main():
     phase = "initial"
     error_context = ""
     consecutive_build_failures = 0
-    best_fuzz_duration = 0  # Track longest successful fuzz run
     final_phase = "not_started"
+    iteration = 0
 
     for iteration in range(1, args.max_iterations + 1):
         print(f"\n{'=' * 70}")
@@ -474,19 +567,16 @@ def main():
         if args.verbose:
             print(f"\n--- USER MESSAGE ---\n{user_message[:2000]}...\n")
 
-        # 3. Call Gemini
+        # 3. Call LLM
         try:
-            response_text, token_info = gemini.generate(system_prompt, user_message)
+            response_text = client.generate(system_prompt, user_message)
         except RuntimeError as e:
             print(f"\n  STOPPED: {e}")
             final_phase = "rate_limited"
-            save_summary(log_dir, gemini, iteration, final_phase)
+            save_summary(log_dir, client, iteration, final_phase)
             break
 
-        print(f"  Tokens this call: in={token_info['input_tokens']:,} "
-              f"out={token_info['output_tokens']:,} "
-              f"thinking={token_info['thinking_tokens']:,}")
-        gemini.print_status()
+        client.print_status()
 
         if args.verbose:
             print(f"\n--- RESPONSE ---\n{response_text[:2000]}...\n")
@@ -501,7 +591,7 @@ def main():
             )
             phase = "build_fix"
             save_iteration(log_dir, iteration, user_message, response_text,
-                           parsed, "NO_CODE_FOUND", "SKIPPED", token_info)
+                           parsed, "NO_CODE_FOUND", "SKIPPED")
             continue
 
         # 5. Write code
@@ -517,7 +607,7 @@ def main():
                 print(f"  ERROR syncing to Docker: {e}")
                 final_phase = "docker_error"
                 save_iteration(log_dir, iteration, user_message, response_text,
-                               parsed, f"Docker sync failed: {e}", "SKIPPED", token_info)
+                               parsed, f"Docker sync failed: {e}", "SKIPPED")
                 break
 
         # 7. Build
@@ -544,7 +634,7 @@ def main():
 
             phase = "build_fix"
             save_iteration(log_dir, iteration, user_message, response_text,
-                           parsed, build_output, "SKIPPED", token_info)
+                           parsed, build_output, "SKIPPED")
             continue
 
         print("  BUILD OK")
@@ -560,13 +650,13 @@ def main():
             print(f"  FUZZ PASSED ({args.fuzz_timeout}s)")
             final_phase = "success"
             save_iteration(log_dir, iteration, user_message, response_text,
-                           parsed, "BUILD_OK", fuzz_output, token_info)
+                           parsed, "BUILD_OK", fuzz_output)
 
             print(f"\n{'=' * 70}")
             print(f"  SUCCESS at iteration {iteration}!")
             print(f"{'=' * 70}")
-            gemini.print_status()
-            save_summary(log_dir, gemini, iteration, final_phase)
+            client.print_status()
+            save_summary(log_dir, client, iteration, final_phase)
             break
         else:
             print("  FUZZ FAILED — mismatch found")
@@ -576,22 +666,74 @@ def main():
             error_context = f"Fuzz test failure:\n{fuzz_output[-4000:]}"
             phase = "fuzz_fix"
             save_iteration(log_dir, iteration, user_message, response_text,
-                           parsed, "BUILD_OK", fuzz_output, token_info)
+                           parsed, "BUILD_OK", fuzz_output)
     else:
         final_phase = "max_iterations"
-        save_summary(log_dir, gemini, iteration, final_phase)
+        save_summary(log_dir, client, iteration, final_phase)
 
     # Final summary
     print(f"\n{'=' * 70}")
     print("FINAL SUMMARY")
     print(f"{'=' * 70}")
+    print(f"  Provider:         {args.provider}")
+    print(f"  Model:            {args.model}")
     print(f"  Iterations:       {iteration}")
     print(f"  Final state:      {final_phase}")
-    print(f"  API calls:        {gemini.call_count}")
-    print(f"  Input tokens:     {gemini.total_input_tokens:,}")
-    print(f"  Output tokens:    {gemini.total_output_tokens:,}")
-    print(f"  Thinking tokens:  {gemini.total_thinking_tokens:,}")
+    client.print_status()
     print(f"  Logs:             {log_dir}")
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+PROVIDER_DEFAULTS = {
+    "claude": "claude-sonnet-4-20250514",
+    "gemini": "gemini-2.5-flash",
+}
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="LLM-driven Cedar-to-WASM compiler generator",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--manual", action="store_true",
+                        help="Manual mode: just build + fuzz, no API calls. "
+                             "Edit src/lib.rs yourself, then run this to test.")
+    parser.add_argument("--provider", choices=["claude", "gemini"], default="claude",
+                        help="LLM provider: claude (via Claude Code CLI) or gemini (via API)")
+    parser.add_argument("--model", default=None,
+                        help="Model ID (default: claude-sonnet-4-20250514 for claude, "
+                             "gemini-2.5-flash for gemini)")
+    parser.add_argument("--max-iterations", type=int, default=50,
+                        help="Maximum LLM improvement iterations")
+    parser.add_argument("--max-requests", type=int, default=200,
+                        help="Hard stop on API requests (gemini free tier only)")
+    parser.add_argument("--fuzz-timeout", type=int, default=30,
+                        help="Seconds to run the fuzzer per iteration")
+    parser.add_argument("--build-mode", choices=["local", "docker"], default="local",
+                        help="Run cargo builds locally or via docker exec")
+    parser.add_argument("--docker-container", default="thia_compiler",
+                        help="Docker container name (for docker mode)")
+    parser.add_argument("--log-dir", default="./llm_compiler_logs",
+                        help="Directory for per-iteration logs")
+    parser.add_argument("--prompt-file", default="./cedar-policy-compiler/prompt.md",
+                        help="Path to the system prompt file")
+    parser.add_argument("--compiler-dir", default="./cedar-policy-compiler",
+                        help="Path to the compiler crate")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print full prompts and responses")
+    args = parser.parse_args()
+
+    # Set default model based on provider if not specified
+    if args.model is None:
+        args.model = PROVIDER_DEFAULTS[args.provider]
+
+    if args.manual:
+        run_manual(args)
+    else:
+        run_auto(args)
 
 
 if __name__ == "__main__":
