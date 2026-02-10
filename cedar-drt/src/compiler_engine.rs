@@ -15,7 +15,7 @@
  */
 
 use cedar_policy::{
-    ffi, Entities, EvalResult, Expression, PolicySet, Request, Schema, ValidationMode,
+    ffi, Effect, Entities, EvalResult, Expression, PolicySet, Request, Schema, ValidationMode,
 };
 
 use cedar_testing::cedar_test_impl::{
@@ -98,19 +98,25 @@ impl CedarTestImplementation for CedarCompilerEngine {
         policies: &PolicySet,
         entities: &Entities,
     ) -> TestResult<TestResponse> {
-        // NOTE: Currently, we compile and execute each policy individually.
-        // The WASM module doesn't yet handle request/entity context - it just
-        // evaluates the policy logic in isolation.
+        // Each policy is compiled to WASM and executed individually.
+        // The WASM evaluate() returns: 1 = satisfied, 0 = not satisfied, 2 = error.
+        // The engine uses the policy's effect (permit/forbid) to determine the
+        // overall authorization decision per Cedar semantics:
+        //   - If any satisfied forbid → Deny (forbid overrides permit)
+        //   - Else if any satisfied permit → Allow
+        //   - Else → Deny (default deny)
 
         let mut compile_time_total = 0u128;
         let mut eval_time_total = 0u128;
-        let mut determining_policies = vec![];
+        let mut satisfied_permits = vec![];
+        let mut satisfied_forbids = vec![];
         let mut errors = vec![];
 
         // Compile and execute each policy
         for policy in policies.policies() {
             let policy_id = policy.id();
             let policy_text = policy.to_string();
+            let is_forbid = policy.effect() == Effect::Forbid;
 
             // Compile the policy
             let wasm_bytes = match self.compile_policy_timed(&policy_text) {
@@ -132,15 +138,21 @@ impl CedarTestImplementation for CedarCompilerEngine {
                 Ok((decision_value, exec_time)) => {
                     eval_time_total += exec_time;
 
-                    // Decision values from runtime.rs:
-                    // Deny = 0, Permit = 1, Error = 2
+                    // WASM return values:
+                    // 1 = policy is satisfied (scope + conditions match)
+                    // 0 = policy is not satisfied
+                    // 2 = error during evaluation
                     match decision_value {
                         1 => {
-                            // Permit decision
-                            determining_policies.push(policy_id.clone());
+                            // Policy is satisfied — file under permit or forbid
+                            if is_forbid {
+                                satisfied_forbids.push(policy_id.clone());
+                            } else {
+                                satisfied_permits.push(policy_id.clone());
+                            }
                         }
                         0 => {
-                            // Deny decision - no action needed
+                            // Policy not satisfied — no contribution to decision
                         }
                         2 => {
                             // Error during evaluation
@@ -170,11 +182,13 @@ impl CedarTestImplementation for CedarCompilerEngine {
 
         let total_time = compile_time_total + eval_time_total;
 
-        // Determine overall decision
-        let decision = if !determining_policies.is_empty() {
-            cedar_policy::Decision::Allow
+        // Cedar authorization semantics: forbid overrides permit
+        let (decision, determining_policies) = if !satisfied_forbids.is_empty() {
+            (cedar_policy::Decision::Deny, satisfied_forbids)
+        } else if !satisfied_permits.is_empty() {
+            (cedar_policy::Decision::Allow, satisfied_permits)
         } else {
-            cedar_policy::Decision::Deny
+            (cedar_policy::Decision::Deny, vec![])
         };
 
         TestResult::Success(TestResponse {
