@@ -125,6 +125,27 @@ There are a few subtle behaviors that your compiler needs to get right.
 
 ---
 
+## Reference Implementations
+
+Your compiler must match the behavior of two existing implementations. The actual source files for both are included below as reference material. Here are the key files to study:
+
+**Rust interpreter** (the production reference):
+- `cedar-policy-core/src/authorizer.rs` — the core authorization loop that evaluates every policy and collects satisfied/errored/forbid/permit results
+- `cedar-policy-core/src/evaluator.rs` — the expression evaluator, including short-circuiting AND/OR, the `in` operator, variable resolution, attribute access, and all operators
+- `cedar-policy-core/src/ast/policy.rs` — how a policy's scope constraints and when/unless body are AND'd together into a single expression
+
+**Lean specification** (formally verified):
+- `Cedar/Spec/Authorizer.lean` — the `isAuthorized` function
+- `Cedar/Spec/Evaluator.lean` — the complete expression evaluator
+- `Cedar/Spec/Policy.lean` — how `Policy.toExpr` builds the combined scope+condition expression
+
+**Test harness** (how your WASM output gets used):
+- `cedar-drt/src/compiler_engine.rs` — calls your `compile_str()`, loads the WASM into Wasmer with no imports, calls `evaluate()`, interprets the i64 result
+
+The crucial insight across both implementations: scope constraints are not special. They become expressions that are AND'd with the when/unless body. Because AND short-circuits, if the scope fails (returns false), the condition is never evaluated — so even a condition that would error is harmless when the scope doesn't match.
+
+---
+
 ## Cedar Policy Examples
 
 Here are some representative policies and what they do. The first group can be evaluated without any request or entity data. The second group requires runtime information.

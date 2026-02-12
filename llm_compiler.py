@@ -60,18 +60,28 @@ class ClaudeCodeClient:
         self.call_count = 0
 
     def generate(self, system_prompt: str, user_message: str) -> str:
-        """Call Claude Code CLI and return the response text."""
+        """Call Claude Code CLI and return the response text.
+
+        Uses --system-prompt for proper system/user separation, and pipes
+        the user message via stdin to avoid OS argument length limits.
+        """
         self.call_count += 1
 
-        full_prompt = system_prompt + "\n\n" + user_message
-
-        cmd = ["claude", "-p", full_prompt, "--model", self.model]
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=300,  # 5 min timeout for long responses
-        )
+        cmd = [
+            "claude", "-p",
+            "--model", self.model,
+            "--system-prompt", system_prompt,
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                input=user_message,
+                capture_output=True,
+                text=True,
+                timeout=600,  # 10 min — first iteration generates a lot of code
+            )
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("claude CLI timed out after 10 minutes")
 
         if result.returncode != 0:
             raise RuntimeError(
@@ -403,25 +413,61 @@ def save_summary(log_dir: Path, client, final_iteration: int, final_phase: str):
 
 
 # ---------------------------------------------------------------------------
+# Reference files — included as context so the LLM can study the real code
+# ---------------------------------------------------------------------------
+
+REFERENCE_FILES = [
+    # Rust interpreter
+    "cedar/cedar-policy-core/src/authorizer.rs",
+    "cedar/cedar-policy-core/src/evaluator.rs",
+    "cedar/cedar-policy-core/src/ast/policy.rs",
+    # Lean specification
+    "cedar-lean/Cedar/Spec/Authorizer.lean",
+    "cedar-lean/Cedar/Spec/Evaluator.lean",
+    "cedar-lean/Cedar/Spec/Policy.lean",
+    # Test harness
+    "cedar-drt/src/compiler_engine.rs",
+]
+
+
+def read_reference_files(cedar_spec_root: Path) -> str:
+    """Read reference implementation files and format them for the LLM."""
+    parts = ["--- Reference Implementation Files ---\n"]
+    for rel_path in REFERENCE_FILES:
+        full_path = cedar_spec_root / rel_path
+        if full_path.exists():
+            content = full_path.read_text()
+            ext = full_path.suffix.lstrip(".")
+            lang = {"rs": "rust", "lean": "lean"}.get(ext, ext)
+            parts.append(f"### {rel_path}\n```{lang}\n{content}\n```\n")
+        else:
+            parts.append(f"### {rel_path}\n(file not found)\n")
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # User message construction
 # ---------------------------------------------------------------------------
 
-def build_user_message(phase: str, current_sources: dict, error_context: str) -> str:
+def build_user_message(phase: str, current_sources: dict, error_context: str,
+                       reference_context: str = "") -> str:
     """Build the user message for the current iteration."""
     parts = []
 
     if phase == "initial":
         parts.append(
-            "Please implement the Cedar policy compiler.\n\n"
+            "Please implement the Cedar policy compiler. "
+            "Respond with the COMPLETE source code for `src/lib.rs` in a ```rust code block, "
+            "and a ```toml code block for `Cargo.toml`.\n\n"
             "Start with the basics:\n"
-            "1. Parse the policy effect: `permit` → the policy can permit, `forbid` → the policy can forbid\n"
-            "2. Check for scope constraints (principal ==, in, is; action ==, in; resource ==, in, is)\n"
-            "3. Check for `when` and `unless` clauses\n"
-            "4. A policy with NO scope constraints and NO when/unless clauses is always satisfied → return 1\n"
-            "5. For policies with scope constraints or conditions that reference runtime context "
-            "(principal, action, resource, context), return 2 (error) since no context is available\n\n"
+            "1. Parse the policy using `cedar_policy::Policy::from_str()`\n"
+            "2. Check for scope constraints and when/unless clauses\n"
+            "3. A policy with NO scope constraints and NO conditions is always satisfied → return 1\n"
+            "4. Try to evaluate static conditions at compile time (e.g. `when { true }` → 1, `when { false }` → 0)\n"
+            "5. For policies you can't fully evaluate, return 1 (satisfied) as a starting point — "
+            "do NOT return 2 (error) unless you're sure the Rust interpreter would also error\n\n"
             "Use the `wasm-encoder` crate to generate valid WASM. "
-            "See the prompt.md for a complete example of generating a constant-returning WASM module.\n"
+            "The system prompt has a complete example of generating a constant-returning WASM module.\n"
         )
     elif phase == "build_fix":
         parts.append(
@@ -438,6 +484,11 @@ def build_user_message(phase: str, current_sources: dict, error_context: str) ->
             "decision as the reference interpreter for this input.\n\n"
         )
         parts.append(error_context)
+
+    # Include reference files on initial and fuzz_fix phases (not build_fix —
+    # the LLM just needs to fix compilation errors there, not study the reference)
+    if reference_context and phase in ("initial", "fuzz_fix"):
+        parts.append("\n\n" + reference_context)
 
     # Always include current source
     parts.append("\n\n--- Current Source Code ---\n")
@@ -529,6 +580,9 @@ def run_auto(args):
         sys.exit(1)
     system_prompt = prompt_file.read_text()
 
+    # Read reference implementation files once
+    reference_context = read_reference_files(cedar_spec_root)
+
     # Initialize LLM client
     if args.provider == "claude":
         client = ClaudeCodeClient(model=args.model)
@@ -563,7 +617,8 @@ def run_auto(args):
         current_sources = read_compiler_source(compiler_dir)
 
         # 2. Build user message
-        user_message = build_user_message(phase, current_sources, error_context)
+        user_message = build_user_message(phase, current_sources, error_context,
+                                          reference_context)
         if args.verbose:
             print(f"\n--- USER MESSAGE ---\n{user_message[:2000]}...\n")
 
@@ -584,7 +639,9 @@ def run_auto(args):
         # 4. Parse response
         parsed = parse_response(response_text)
         if not parsed.get("lib_rs"):
-            print("  WARNING: No Rust code found in response. Retrying...")
+            print("  WARNING: No Rust code found in response.")
+            print(f"  Response preview: {response_text[:300]}...")
+            print("  Retrying...")
             error_context = (
                 "Your previous response did not contain a ```rust code block. "
                 "Please provide the COMPLETE src/lib.rs source code in a ```rust block."
