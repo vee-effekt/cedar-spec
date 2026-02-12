@@ -27,6 +27,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -377,6 +378,181 @@ def extract_fuzz_failure(output: str, cedar_spec_root: Path, mode: str, containe
 
 
 # ---------------------------------------------------------------------------
+# Regression test management
+# ---------------------------------------------------------------------------
+
+def get_regression_dir(cedar_spec_root: Path) -> Path:
+    """Return the path to the regression corpus directory."""
+    return cedar_spec_root / "cedar-policy-compiler" / "regression_corpus"
+
+
+def save_regression_artifact(cedar_spec_root: Path, iteration: int, mode: str, container: str):
+    """Save the current fuzz failure as a regression test.
+
+    Copies the crash artifact binary (for replay) and last_test.txt
+    (for human-readable context) into the regression corpus directory.
+    """
+    regression_dir = get_regression_dir(cedar_spec_root)
+    regression_dir.mkdir(parents=True, exist_ok=True)
+
+    artifacts_dir = (
+        cedar_spec_root / "cedar-drt" / "fuzz" / "artifacts" / "abac-compiler"
+    )
+
+    # Find the most recent crash artifact (binary file for replay)
+    crash_files = sorted(
+        [f for f in artifacts_dir.iterdir()
+         if f.name.startswith("crash-") and f.is_file()],
+        key=lambda f: f.stat().st_mtime,
+        reverse=True,
+    ) if artifacts_dir.exists() else []
+
+    if not crash_files:
+        print("  WARNING: No crash artifact found to save as regression test.")
+        return
+
+    crash_file = crash_files[0]
+    test_id = f"iter{iteration:03d}_{crash_file.name}"
+
+    # Copy the binary artifact (for cargo fuzz replay)
+    dest_artifact = regression_dir / test_id
+    if not dest_artifact.exists():
+        shutil.copy2(crash_file, dest_artifact)
+        print(f"  Saved regression artifact: {test_id}")
+
+    # Copy the human-readable last_test.txt alongside it
+    last_test = artifacts_dir / "last_test.txt"
+    if last_test.exists():
+        dest_txt = regression_dir / f"{test_id}.txt"
+        if not dest_txt.exists():
+            shutil.copy2(last_test, dest_txt)
+
+
+def run_regression_tests(cedar_spec_root: Path, mode: str, container: str) -> tuple:
+    """Replay all saved regression artifacts through the fuzz target.
+
+    Returns (all_passed: bool, failure_details: str).
+    If there are no regression tests, returns (True, "").
+    """
+    regression_dir = get_regression_dir(cedar_spec_root)
+    if not regression_dir.exists():
+        return True, ""
+
+    artifacts = sorted([
+        f for f in regression_dir.iterdir()
+        if not f.name.endswith(".txt") and f.is_file()
+    ])
+
+    if not artifacts:
+        return True, ""
+
+    print(f"  Running {len(artifacts)} regression test(s)...")
+
+    failures = []
+    for artifact in artifacts:
+        if mode == "docker":
+            cwd = "/opt/src/cedar-spec/cedar-drt"
+            artifact_path = f"/opt/src/cedar-spec/cedar-policy-compiler/regression_corpus/{artifact.name}"
+            cmd = [
+                "bash", "-c",
+                f"source /root/.profile && source ./set_env_vars.sh && "
+                f"cargo fuzz run abac-compiler -s none {artifact_path} 2>&1"
+            ]
+        else:
+            cwd = str(cedar_spec_root / "cedar-drt")
+            cmd = [
+                "cargo", "fuzz", "run", "abac-compiler", "-s", "none",
+                str(artifact),
+            ]
+
+        rc, stdout, stderr = run_command(
+            cmd, cwd=cwd, timeout=60, mode=mode, container=container
+        )
+
+        if rc != 0:
+            # Read the human-readable description if available
+            txt_file = regression_dir / f"{artifact.name}.txt"
+            description = ""
+            if txt_file.exists():
+                try:
+                    description = txt_file.read_text()[:1500]
+                except Exception:
+                    pass
+
+            error_output = (stdout + "\n" + stderr).strip()
+            # Extract just the assertion failure
+            error_lines = []
+            for line in error_output.split("\n"):
+                if any(kw in line for kw in [
+                    "assertion", "panicked", "Mismatch", "left:", "right:",
+                ]):
+                    error_lines.append(line)
+
+            failures.append({
+                "artifact": artifact.name,
+                "description": description,
+                "error": "\n".join(error_lines) if error_lines else error_output[-500:],
+            })
+
+    if not failures:
+        print(f"  All {len(artifacts)} regression test(s) passed.")
+        return True, ""
+
+    print(f"  {len(failures)}/{len(artifacts)} regression test(s) FAILED.")
+
+    # Format failure details for the LLM
+    parts = [f"{len(failures)} regression test(s) failed (these are test cases from previous "
+             f"iterations that your compiler previously got wrong and must now handle correctly):\n"]
+    for i, f in enumerate(failures, 1):
+        parts.append(f"--- Regression failure {i}: {f['artifact']} ---")
+        if f["description"]:
+            parts.append(f["description"])
+        if f["error"]:
+            parts.append(f"Error: {f['error']}")
+        parts.append("")
+
+    return False, "\n".join(parts)
+
+
+def get_regression_context(cedar_spec_root: Path) -> str:
+    """Build a summary of all regression test cases for inclusion in the prompt.
+
+    Returns the human-readable descriptions of all saved regression tests
+    so the LLM can see the full set of cases it must handle.
+    """
+    regression_dir = get_regression_dir(cedar_spec_root)
+    if not regression_dir.exists():
+        return ""
+
+    txt_files = sorted([
+        f for f in regression_dir.iterdir()
+        if f.name.endswith(".txt") and f.is_file()
+    ])
+
+    if not txt_files:
+        return ""
+
+    parts = [f"\n--- Accumulated Regression Tests ({len(txt_files)} cases) ---\n"
+             "These are test cases from previous iterations. Your code must handle ALL of them correctly.\n"]
+
+    for txt_file in txt_files:
+        try:
+            content = txt_file.read_text()[:1200]
+            parts.append(f"### {txt_file.stem}")
+            parts.append(content)
+            parts.append("")
+        except Exception:
+            pass
+
+    # Cap total size to avoid blowing up the context
+    result = "\n".join(parts)
+    if len(result) > 15000:
+        result = result[:15000] + "\n... (truncated, more regression tests exist)"
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
@@ -450,7 +626,8 @@ def read_reference_files(cedar_spec_root: Path) -> str:
 # ---------------------------------------------------------------------------
 
 def build_user_message(phase: str, current_sources: dict, error_context: str,
-                       reference_context: str = "") -> str:
+                       reference_context: str = "",
+                       regression_context: str = "") -> str:
     """Build the user message for the current iteration."""
     parts = []
 
@@ -459,15 +636,19 @@ def build_user_message(phase: str, current_sources: dict, error_context: str,
             "Please implement the Cedar policy compiler. "
             "Respond with the COMPLETE source code for `src/lib.rs` in a ```rust code block, "
             "and a ```toml code block for `Cargo.toml`.\n\n"
+            "IMPORTANT: Structure your compiler as an AST-walking code generator. "
+            "Use `cedar_policy_core::ast::ExprKind` to pattern-match on expression nodes "
+            "and recursively emit WASM instructions. Do NOT do string matching on policy text. "
+            "See the system prompt's 'Recommended Approach: AST-Walking Compiler' section for the pattern.\n\n"
             "Start with the basics:\n"
-            "1. Parse the policy using `cedar_policy::Policy::from_str()`\n"
-            "2. Check for scope constraints and when/unless clauses\n"
-            "3. A policy with NO scope constraints and NO conditions is always satisfied → return 1\n"
-            "4. Try to evaluate static conditions at compile time (e.g. `when { true }` → 1, `when { false }` → 0)\n"
-            "5. For policies you can't fully evaluate, return 1 (satisfied) as a starting point — "
+            "1. Parse the policy using `cedar_policy::Policy::parse(None, text)`\n"
+            "2. Get the full expression tree: `let ast_policy: &ast::Policy = policy.as_ref(); "
+            "let condition = ast_policy.condition();`\n"
+            "3. Recursively walk `condition` with a `compile_expr` function that matches on `ExprKind`\n"
+            "4. Start by handling `Lit(Bool)`, `Lit(Long)`, `And`, `Or`, `UnaryApp(Not/Neg)`, "
+            "`BinaryApp(Eq/Less/LessEq/Add/Sub/Mul)`, and `If`\n"
+            "5. For `ExprKind` variants you haven't implemented yet, return 1 (satisfied) as a safe default — "
             "do NOT return 2 (error) unless you're sure the Rust interpreter would also error\n\n"
-            "Use the `wasm-encoder` crate to generate valid WASM. "
-            "The system prompt has a complete example of generating a constant-returning WASM module.\n"
         )
     elif phase == "build_fix":
         parts.append(
@@ -480,14 +661,26 @@ def build_user_message(phase: str, current_sources: dict, error_context: str,
             "The code compiled successfully, but the fuzzer found a MISMATCH between your "
             "compiler's output and the reference Cedar interpreter.\n\n"
             "Analyze the failure below. The test case shows the policy, request, and entities "
-            "that caused the mismatch. Your compiler needs to produce the same authorization "
-            "decision as the reference interpreter for this input.\n\n"
+            "that caused the mismatch. Identify which `ExprKind` variant your `compile_expr` "
+            "isn't handling correctly, and fix the general case.\n\n"
+        )
+        parts.append(error_context)
+    elif phase == "regression_fix":
+        parts.append(
+            "The code compiled successfully, but REGRESSION TESTS failed. These are test cases "
+            "from previous iterations that your compiler used to get wrong. Your latest changes "
+            "must not break previously-working cases.\n\n"
+            "Fix your compiler so that ALL regression tests pass, plus any new cases.\n\n"
         )
         parts.append(error_context)
 
+    # Include regression test context so the LLM sees the full accumulated test history
+    if regression_context and phase in ("fuzz_fix", "regression_fix", "initial"):
+        parts.append("\n\n" + regression_context)
+
     # Include reference files on initial and fuzz_fix phases (not build_fix —
     # the LLM just needs to fix compilation errors there, not study the reference)
-    if reference_context and phase in ("initial", "fuzz_fix"):
+    if reference_context and phase in ("initial", "fuzz_fix", "regression_fix"):
         parts.append("\n\n" + reference_context)
 
     # Always include current source
@@ -616,9 +809,10 @@ def run_auto(args):
         # 1. Read current source
         current_sources = read_compiler_source(compiler_dir)
 
-        # 2. Build user message
+        # 2. Build user message (include regression test context)
+        regression_context = get_regression_context(cedar_spec_root)
         user_message = build_user_message(phase, current_sources, error_context,
-                                          reference_context)
+                                          reference_context, regression_context)
         if args.verbose:
             print(f"\n--- USER MESSAGE ---\n{user_message[:2000]}...\n")
 
@@ -697,7 +891,20 @@ def run_auto(args):
         print("  BUILD OK")
         consecutive_build_failures = 0
 
-        # 8. Run fuzzer
+        # 8. Run regression tests first (replay previously-failing cases)
+        regression_passed, regression_failures = run_regression_tests(
+            cedar_spec_root, args.build_mode, args.docker_container
+        )
+
+        if not regression_passed:
+            print("  REGRESSION TESTS FAILED")
+            error_context = f"Regression test failures:\n{regression_failures}"
+            phase = "regression_fix"
+            save_iteration(log_dir, iteration, user_message, response_text,
+                           parsed, "BUILD_OK", f"REGRESSION_FAIL\n{regression_failures}")
+            continue
+
+        # 9. Run fuzzer (only if regression tests pass)
         print(f"  Fuzzing for {args.fuzz_timeout}s...")
         fuzz_passed, fuzz_output = run_fuzz(
             cedar_spec_root, args.fuzz_timeout, args.build_mode, args.docker_container
@@ -719,6 +926,10 @@ def run_auto(args):
             print("  FUZZ FAILED — mismatch found")
             if args.verbose:
                 print(f"  {fuzz_output[:500]}...")
+
+            # Save the crash artifact as a regression test for future iterations
+            save_regression_artifact(cedar_spec_root, iteration, args.build_mode,
+                                     args.docker_container)
 
             error_context = f"Fuzz test failure:\n{fuzz_output[-4000:]}"
             phase = "fuzz_fix"

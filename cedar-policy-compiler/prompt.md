@@ -3,7 +3,7 @@ You are a compiler engineer.
 You are currently implementing a compiler for the Cedar programming language, an open-source language that allows users to define permissions as policies. You will do this by implementing a Rust crate that compiles Cedar policies into WebAssembly bytecode.
 
 Your compiler is to be validated using a differential testing system. This system
-generates random Cedar policies, authorization requests, and entity hierarchies, and runs these inputs through (a) a Cedar interpreter written in Rust, (b) an executable Lean specification, and (c) your compiler. If any of the three disagrees with the others on even a single test case, the test fails.
+generates random Cedar policies, authorization requests, and entity hierarchies, and runs these inputs through (a) a Cedar interpreter written in Rust, (b) an executable Lean specification, and (c) your compiler. If any of the three disagrees with the others on even a single test case, the test fails. Write this like a regular compiler, walking the expression tree and emitting Wasm bytecode--absolutely do not write it as a giant switch statement, or a bunch of if statements on string matching, etc.
 
 Your job is to make the WASM compiler agree with the other two on every generated input.
 
@@ -331,11 +331,158 @@ Start simple and let the test failures guide your decisions. The failures will s
 
 ---
 
-## Recommended Approach
+## Recommended Approach: AST-Walking Compiler
 
-For **parsing**, add `cedar-policy = { path = "../cedar/cedar-policy" }` to your `Cargo.toml`. This gives you access to the official Cedar parser. Use `cedar_policy::Policy::from_str()` to parse policy text, then use the policy API to inspect scope constraints and conditions. Don't try to parse Cedar syntax by hand.
+Your compiler must be structured as a proper AST-walking code generator. **Do not** do string matching on the policy text (e.g. `policy_str.contains("when { true }")`). **Do not** convert the policy to a string and then regex or substring match. Instead, parse the policy into an expression tree and recursively walk it, emitting WASM instructions for each node.
 
-For **WASM generation**, add `wasm-encoder = "0.225"` to your `Cargo.toml`. This crate lets you build WASM modules programmatically. Here's a minimal example that generates a WASM module returning a constant value:
+### Dependencies
+
+Your `Cargo.toml` needs these:
+
+```toml
+[dependencies]
+cedar-policy = { path = "../cedar/cedar-policy" }
+cedar-policy-core = { path = "../cedar/cedar-policy-core" }
+wasm-encoder = "0.225"
+```
+
+- `cedar-policy` gives you the parser: `cedar_policy::Policy::parse(None, text)`
+- `cedar-policy-core` gives you the AST types you need to pattern-match on
+- `wasm-encoder` lets you build WASM modules programmatically
+
+### Accessing the Expression Tree
+
+After parsing a policy, you can access the internal AST like this:
+
+```rust
+use cedar_policy_core::ast::{self, ExprKind, Literal, Var, BinaryOp, UnaryOp};
+
+let policy = cedar_policy::Policy::parse(None, policy_text)?;
+let ast_policy: &ast::Policy = policy.as_ref(); // AsRef<ast::Policy>
+let condition: ast::Expr = ast_policy.condition();
+```
+
+The `condition()` method returns the **complete expression tree** for the policy. It combines the scope constraints (principal, action, resource) and the when/unless body into a single AND-chain:
+
+```
+principal_constraint && action_constraint && resource_constraint && non_scope_constraints
+```
+
+Because `&&` short-circuits, if the scope doesn't match, the body is never evaluated — which is exactly the semantics you need.
+
+### The ExprKind Enum
+
+The expression tree uses `ExprKind` as its node type. Here are all the variants you need to handle:
+
+```rust
+pub enum ExprKind {
+    Lit(Literal),                    // bool, i64, string, entity UID
+    Var(Var),                        // Principal, Action, Resource, Context
+    Slot(SlotId),                    // Template slots (rarely seen in fuzz tests)
+    Unknown(Unknown),                // Partial evaluation (ignore for now)
+    If { test_expr, then_expr, else_expr },
+    And { left, right },             // Short-circuits on false
+    Or { left, right },              // Short-circuits on true
+    UnaryApp { op, arg },            // Not, Neg, IsEmpty
+    BinaryApp { op, arg1, arg2 },    // Eq, Less, LessEq, Add, Sub, Mul, In,
+                                     // Contains, ContainsAll, ContainsAny,
+                                     // GetTag, HasTag
+    ExtensionFunctionApp { fn_name, args },  // ip(), decimal(), etc.
+    GetAttr { expr, attr },          // entity.attr or record["key"]
+    HasAttr { expr, attr },          // entity has attr
+    Like { expr, pattern },          // string wildcard matching
+    Is { expr, entity_type },        // entity type test
+    Set(elements),                   // [expr, expr, ...]
+    Record(fields),                  // { key: expr, ... }
+}
+```
+
+Access it with `expr.expr_kind()` which returns `&ExprKind`.
+
+### The Recursive Compilation Pattern
+
+The core of your compiler is a single recursive function that walks the expression tree and emits WASM instructions. Here's the skeleton:
+
+```rust
+fn compile_expr(&mut self, expr: &ast::Expr, func: &mut Function) {
+    match expr.expr_kind() {
+        ExprKind::Lit(lit) => match lit {
+            Literal::Bool(b) => {
+                func.instruction(&Instruction::I64Const(if *b { 1 } else { 0 }));
+            }
+            Literal::Long(n) => {
+                func.instruction(&Instruction::I64Const(*n));
+            }
+            Literal::String(s) => { /* encode string, push pointer */ }
+            Literal::EntityUID(uid) => { /* encode entity ref, push pointer */ }
+        },
+
+        ExprKind::And { left, right } => {
+            // Short-circuit: evaluate left; if false, skip right
+            self.compile_expr(left, func);
+            // ... WASM branching to short-circuit ...
+            self.compile_expr(right, func);
+        }
+
+        ExprKind::Or { left, right } => {
+            // Short-circuit: evaluate left; if true, skip right
+            self.compile_expr(left, func);
+            // ... WASM branching to short-circuit ...
+            self.compile_expr(right, func);
+        }
+
+        ExprKind::BinaryApp { op, arg1, arg2 } => {
+            self.compile_expr(arg1, func);
+            self.compile_expr(arg2, func);
+            match op {
+                BinaryOp::Eq => { /* i64.eq or value comparison */ }
+                BinaryOp::Less => { func.instruction(&Instruction::I64LtS); }
+                BinaryOp::Add => { func.instruction(&Instruction::I64Add); }
+                // ... other ops ...
+            }
+        }
+
+        ExprKind::UnaryApp { op, arg } => {
+            self.compile_expr(arg, func);
+            match op {
+                UnaryOp::Not => { func.instruction(&Instruction::I64Eqz); }
+                UnaryOp::Neg => { /* 0 - value */ }
+                // ...
+            }
+        }
+
+        ExprKind::If { test_expr, then_expr, else_expr } => {
+            self.compile_expr(test_expr, func);
+            // WASM if-else block
+            self.compile_expr(then_expr, func);
+            // else
+            self.compile_expr(else_expr, func);
+        }
+
+        ExprKind::Var(var) => {
+            // Load the request variable from embedded data
+            // ...
+        }
+
+        ExprKind::GetAttr { expr, attr } => {
+            // Compile expr, then look up attribute
+            // ...
+        }
+
+        // Handle ALL other variants — don't leave match arms missing.
+        // For variants you haven't implemented yet, return 2 (error)
+        // only if you're sure the reference interpreter would also error.
+        // Otherwise return 1 (satisfied) as a safe default.
+        _ => { /* unimplemented variant */ }
+    }
+}
+```
+
+**This is the structure your compiler must follow.** Every iteration should expand the set of `ExprKind` variants that are handled correctly, but the recursive walk/emit pattern stays the same throughout.
+
+### WASM Generation Basics
+
+The `wasm-encoder` crate builds WASM modules. Here's a minimal example:
 
 ```rust
 use wasm_encoder::{CodeSection, ExportKind, ExportSection, Function,
@@ -367,7 +514,21 @@ fn make_const_wasm(value: i64) -> Vec<u8> {
 }
 ```
 
-Start by getting the simplest cases right: return 1 for `permit(principal, action, resource);`, return 1 or 0 for static `when`/`unless` conditions. Then let the test failures tell you what to handle next.
+Your compiler should build on this pattern, but instead of emitting a single `I64Const`, it walks the expression tree and emits the instructions needed to evaluate it.
+
+### Iterative Build-Up
+
+Start with the simplest expression kinds and expand:
+
+1. **First**: `Lit(Bool)`, `Lit(Long)`, `And`, `Or`, `UnaryApp(Not/Neg)`, `BinaryApp(Eq/Less/LessEq/Add/Sub/Mul)`, `If`. This covers static policies with no runtime data.
+
+2. **Next**: `Var(Principal/Action/Resource)`, `BinaryApp(In)`, `Is`, `Lit(EntityUID)`. This requires embedding request data — you'll need to extend `compile_str` to accept request+entity data (the harness has it).
+
+3. **Then**: `Var(Context)`, `GetAttr`, `HasAttr`, `Lit(String)`, `Like`, set/record operations. This requires embedding entity attributes and context.
+
+4. **Finally**: `ExtensionFunctionApp` (ip, decimal), `Set`, `Record`, `BinaryApp(Contains/ContainsAll/ContainsAny)`.
+
+Each iteration, let the test failures tell you what to handle next. The failures will show exactly which `ExprKind` variant you're missing.
 
 ---
 
@@ -381,13 +542,20 @@ When the code doesn't compile, read the error message carefully. Build errors ar
 
 ## Fixing Test Failures
 
-When the tests find a mismatch, you'll receive the failing policy, request, and entities from the `last_test.txt` file, along with the assertion message showing the Rust result versus your result.
+When the tests find a mismatch, you'll receive one or more failing test cases. Each test case includes the policy, request, entities, and the assertion message showing the Rust result versus your result.
 
-Before writing any code, work through the problem step by step. Read the policy and understand what it's asking. Look at the request and entities and figure out what the Rust interpreter would return for this specific combination. Then figure out what your compiler currently returns and why it's different. Identify the root cause — is it a missing operator? A scope constraint you don't handle? A wrong evaluation of some expression?
+**Important: You will also receive previously-failing test cases as regression tests.** These are test cases from earlier iterations that your compiler previously got wrong. Your fix must handle ALL of these, not just the latest failure. If you fix the new failure but break a previously-passing regression test, that's still a failure.
 
-When you fix the problem, fix the general case, not just the specific failing input. If the failure is because you don't handle `==` scope constraints, implement `==` scope constraints in general, not just for the particular entity that happened to appear in the failing test.
+Before writing any code, work through the problem step by step:
 
-If you find yourself stuck on the same kind of failure after several attempts, step back and reconsider your approach. Sometimes it's easier to rewrite a component cleanly than to keep patching it. A smaller compiler that handles fewer cases correctly is much better than a larger one that handles many cases incorrectly.
+1. Read each failing policy and understand what it's asking.
+2. Look at the request and entities and figure out what the Rust interpreter would return.
+3. Figure out what your compiler currently returns and why it's different.
+4. Identify the root cause — which `ExprKind` variant are you not handling? Is your short-circuiting wrong? Is an operator implemented incorrectly?
+
+When you fix the problem, fix the general case, not just the specific failing input. If the failure is because you don't handle `GetAttr`, implement `GetAttr` in general in your `compile_expr` match, not just for the particular attribute that appeared in the test.
+
+If you find yourself stuck on the same kind of failure after several attempts, step back and reconsider your approach. Sometimes it's easier to rewrite a component cleanly than to keep patching it. A smaller compiler that handles fewer `ExprKind` variants correctly is much better than a larger one that handles many variants incorrectly.
 
 ## Keeping Things Simple
 
