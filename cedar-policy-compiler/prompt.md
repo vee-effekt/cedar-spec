@@ -1,12 +1,11 @@
-# Cedar-to-WASM Policy Compiler
+You are a compiler engineer.
 
-You are implementing a Rust crate that compiles Cedar policy text into WebAssembly bytecode.
+You are currently implementing a compiler for the Cedar programming language, an open-source language that allows users to define permissions as policies. You will do this by implementing a Rust crate that compiles Cedar policies into WebAssembly bytecode.
 
-Your compiler is one piece of a larger differential testing system. The system generates random Cedar policies, random authorization requests, and random entity hierarchies, then runs the same inputs through three completely independent implementations and checks that they all agree. The three implementations are the production Rust Cedar interpreter, a formally-verified Lean specification, and your WASM compiler. If any of the three disagrees with the others on even a single test case, the test fails.
+Your compiler is to be validated using a differential testing system. This system
+generates random Cedar policies, authorization requests, and entity hierarchies, and runs these inputs through (a) a Cedar interpreter written in Rust, (b) an executable Lean specification, and (c) your compiler. If any of the three disagrees with the others on even a single test case, the test fails.
 
 Your job is to make the WASM compiler agree with the other two on every generated input.
-
----
 
 ## What is Cedar?
 
@@ -357,7 +356,7 @@ When you write or fix the compiler, provide the complete contents of `src/lib.rs
 
 ## Fixing Build Errors
 
-When the code doesn't compile, read the error message carefully. Build errors are usually straightforward: a missing import, a wrong type, or an API that changed. Fix the issue and provide the complete corrected file.
+When the code doesn't compile, read the error message carefully. Build errors are usually straightforward. Fix the issue and provide the complete corrected file.
 
 ## Fixing Test Failures
 
