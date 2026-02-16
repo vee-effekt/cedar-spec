@@ -4,6 +4,17 @@ You are implementing a compiler for the Cedar programming language. Cedar is an 
 
 Your compiler walks the Cedar expression AST and emits Rust code. It is validated by differential testing: random policies, requests, and entity hierarchies are generated and run through (a) the Cedar Rust interpreter, (b) the executable Lean specification, and (c) your compiler. If any of the three disagrees on even a single test case, the test fails.
 
+When the compiler disagrees with either interpreter, the failing test case is saved to `cedar-drt/fuzz/failures/compiler/` (override with `COMPILER_FAILURES_DIR`). Each failure is a directory containing:
+- `policy.cedar` — the policy text
+- `entities.json` — entities in Cedar JSON format
+- `test.json` — request and expected decision in Cedar integration test format
+
+To replay all saved failures:
+```
+cargo test -p cedar-drt --test replay_compiler_failures
+```
+
+
 ## Reference implementations (your behavioral oracle)
 
 **Rust interpreter:**
@@ -19,18 +30,6 @@ Your compiler walks the Cedar expression AST and emits Rust code. It is validate
 **Test harness:**
 - `cedar-drt/src/compiler_engine.rs` — how your compiler output gets called
 - `cedar-drt/src/tests.rs` — three-way comparison (Rust vs Lean vs compiler)
-
-## Logging and failure infrastructure
-
-When the compiler disagrees with either interpreter, the failing test case is saved to `fuzz/failures/compiler/` (override with `COMPILER_FAILURES_DIR`). Each failure is a directory containing:
-- `policy.cedar` — the policy text
-- `entities.json` — entities in Cedar JSON format
-- `test.json` — request and expected decision in Cedar integration test format
-
-To replay all saved failures:
-```
-cargo test -p cedar-drt --test replay_compiler_failures
-```
 
 ## Accessing the Cedar AST
 
