@@ -109,7 +109,9 @@ impl CedarTestImplementation for CedarCompilerEngine {
     ) -> TestResult<TestResponse> {
         log_to_file(&format!(
             "--- is_authorized called ---\nPolicies:\n{}\nRequest: {}\nEntities: {}\n",
-            policies, request, entities.as_ref()
+            policies,
+            request,
+            entities.as_ref()
         ));
 
         // Each policy is compiled to WASM and executed individually.
@@ -255,10 +257,7 @@ impl CedarTestImplementation for CedarCompilerEngine {
         let errors = if result.validation_passed() {
             Vec::new()
         } else {
-            result
-                .validation_errors()
-                .map(|e| e.to_string())
-                .collect()
+            result.validation_errors().map(|e| e.to_string()).collect()
         };
 
         TestResult::Success(TestValidationResult {
@@ -284,10 +283,7 @@ impl CedarTestImplementation for CedarCompilerEngine {
         let errors = if result.validation_passed() {
             Vec::new()
         } else {
-            result
-                .validation_errors()
-                .map(|e| e.to_string())
-                .collect()
+            result.validation_errors().map(|e| e.to_string()).collect()
         };
 
         TestResult::Success(TestValidationResult {

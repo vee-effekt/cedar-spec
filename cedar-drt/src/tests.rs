@@ -24,10 +24,13 @@ use cedar_policy::{
     Response, Schema, ValidationMode, ValidationResult, Validator,
 };
 
+use cedar_policy_core::entities::TypeAndId;
 use libfuzzer_sys::arbitrary::{self, Unstructured};
 use log::info;
 use miette::miette;
 use std::collections::HashSet;
+use std::fs;
+use std::io::Write;
 
 /// Times for cedar-policy authorization and validation.
 pub const RUST_AUTH_MSG: &str = "rust_auth (ns) : ";
@@ -140,6 +143,98 @@ pub fn run_auth_test(
     }
 }
 
+/// Save a failing test case to disk in Cedar integration test format.
+/// Creates a directory with .cedar, .entities.json, and .json files that can
+/// be replayed via the replay runner.
+///
+/// `component` is "compiler" or "lean" — determines the output directory.
+fn save_failure(
+    request: &Request,
+    policies: &PolicySet,
+    entities: &Entities,
+    rust_response: &ffi::Response,
+    component: &str,
+    kind: &str,
+) {
+    let env_var = format!("{}_FAILURES_DIR", component.to_uppercase());
+    let default_dir = format!("fuzz/failures/{}", component);
+    let base = std::env::var(&env_var).unwrap_or_else(|_| default_dir);
+    let _ = fs::create_dir_all(&base);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let name = format!("fail_{}_{}", kind, timestamp);
+    let dir = format!("{}/{}", base, name);
+    let _ = fs::create_dir_all(&dir);
+
+    // policy.cedar
+    let policy_text: String = policies
+        .as_ref()
+        .static_policies()
+        .map(|p| p.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _ = fs::write(format!("{}/policy.cedar", dir), &policy_text);
+
+    // entities.json
+    if let Ok(f) = fs::File::create(format!("{}/entities.json", dir)) {
+        let _ = entities.write_to_json(f);
+    }
+
+    // test.json — Cedar integration test format
+    let euid_to_json = |euid: &cedar_policy::EntityUid| -> serde_json::Value {
+        let tyid = TypeAndId::from(euid.as_ref());
+        serde_json::to_value(tyid).unwrap_or(serde_json::Value::Null)
+    };
+
+    let context_json = request
+        .context()
+        .map(|ctx| {
+            ctx.clone()
+                .into_iter()
+                .map(|(k, pval)| {
+                    (
+                        k,
+                        pval.as_ref()
+                            .to_natural_json()
+                            .unwrap_or(serde_json::Value::Null),
+                    )
+                })
+                .collect::<serde_json::Map<String, serde_json::Value>>()
+        })
+        .map(serde_json::Value::Object)
+        .unwrap_or(serde_json::json!({}));
+
+    let json_request = cedar_testing::integration_testing::JsonRequest {
+        description: format!("Compiler {} failure", kind),
+        principal: euid_to_json(request.principal().unwrap()),
+        action: euid_to_json(request.action().unwrap()),
+        resource: euid_to_json(request.resource().unwrap()),
+        context: context_json,
+        validate_request: false,
+        decision: rust_response.decision(),
+        reason: rust_response.diagnostics().reason().cloned().collect(),
+        errors: rust_response
+            .diagnostics()
+            .errors()
+            .map(|e| e.policy_id().clone())
+            .collect(),
+    };
+
+    let test = cedar_testing::integration_testing::JsonTest {
+        schema: String::new(),
+        policies: "policy.cedar".into(),
+        entities: "entities.json".into(),
+        should_validate: false,
+        requests: vec![json_request],
+    };
+
+    if let Ok(f) = fs::File::create(format!("{}/test.json", dir)) {
+        let _ = serde_json::to_writer_pretty(f, &test);
+    }
+}
+
 /// Compare the behavior of the authorizer across three implementations:
 /// Rust interpreter, Lean spec, and compiled policies.
 /// Panics if any two do not agree.
@@ -193,9 +288,18 @@ pub fn run_three_way_auth_test(
     };
 
     // Compare Rust vs Lean
+    let rust_cmp_for_lean = rust_res_for_comparison(lean_impl.error_comparison_mode());
     match lean_res {
-        TestResult::Failure(err) => {
+        TestResult::Failure(ref err) => {
             if !err.contains("unknown extension function") {
+                save_failure(
+                    request,
+                    policies,
+                    entities,
+                    &rust_cmp_for_lean,
+                    "lean",
+                    "error",
+                );
                 panic!(
                     "Lean error for {request}\nPolicies:\n{}\nEntities:\n{}\nError: {err}",
                     &policies,
@@ -204,9 +308,18 @@ pub fn run_three_way_auth_test(
             }
         }
         TestResult::Success(ref lean_result) => {
-            let rust_cmp = rust_res_for_comparison(lean_impl.error_comparison_mode());
+            if rust_cmp_for_lean != lean_result.response {
+                save_failure(
+                    request,
+                    policies,
+                    entities,
+                    &rust_cmp_for_lean,
+                    "lean",
+                    "mismatch",
+                );
+            }
             assert_eq!(
-                rust_cmp,
+                rust_cmp_for_lean,
                 lean_result.response,
                 "Rust vs Lean mismatch for {request}\nPolicies:\n{policies}\nEntities:\n{}",
                 entities.as_ref()
@@ -215,18 +328,36 @@ pub fn run_three_way_auth_test(
     }
 
     // Compare Rust vs Compiler
+    let rust_cmp_for_compiler = rust_res_for_comparison(compiler_impl.error_comparison_mode());
     match compiler_res {
-        TestResult::Failure(err) => {
+        TestResult::Failure(ref err) => {
+            save_failure(
+                request,
+                policies,
+                entities,
+                &rust_cmp_for_compiler,
+                "compiler",
+                "error",
+            );
             panic!(
                 "Compiler error for {request}\nPolicies:\n{}\nEntities:\n{}\nError: {err}",
                 &policies,
                 &entities.as_ref()
             );
         }
-        TestResult::Success(compiler_result) => {
-            let rust_cmp = rust_res_for_comparison(compiler_impl.error_comparison_mode());
+        TestResult::Success(ref compiler_result) => {
+            if rust_cmp_for_compiler != compiler_result.response {
+                save_failure(
+                    request,
+                    policies,
+                    entities,
+                    &rust_cmp_for_compiler,
+                    "compiler",
+                    "mismatch",
+                );
+            }
             assert_eq!(
-                rust_cmp,
+                rust_cmp_for_compiler,
                 compiler_result.response,
                 "Rust vs Compiler mismatch for {request}\nPolicies:\n{policies}\nEntities:\n{}",
                 entities.as_ref()
@@ -406,6 +537,105 @@ pub fn run_req_val_test(
             }
         }
     }
+}
+
+/// Replay saved compiler failure test cases from a directory.
+/// Each subdirectory should contain:
+///   - `policy.cedar` — the policy text
+///   - `entities.json` — entities in Cedar JSON format
+///   - `test.json` — test descriptor with request and expected decision
+///
+/// Returns the number of test cases replayed.
+/// Panics if the compiler disagrees with the Rust authorizer on any replayed case.
+pub fn replay_compiler_failures(
+    compiler_impl: &impl CedarTestImplementation,
+    failures_dir: &str,
+) -> usize {
+    use cedar_testing::integration_testing::JsonTest;
+    use std::str::FromStr;
+
+    let dir = std::path::Path::new(failures_dir);
+    if !dir.exists() {
+        return 0;
+    }
+
+    let mut count = 0;
+    let mut entries: Vec<_> = fs::read_dir(dir)
+        .expect("Failed to read failures directory")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .collect();
+    entries.sort_by_key(|e| e.path());
+
+    for entry in entries {
+        let test_dir = entry.path();
+        let test_json_path = test_dir.join("test.json");
+        let policy_path = test_dir.join("policy.cedar");
+        let entities_path = test_dir.join("entities.json");
+
+        if !test_json_path.exists() || !policy_path.exists() || !entities_path.exists() {
+            continue;
+        }
+
+        let test_name = test_dir.file_name().unwrap().to_string_lossy().to_string();
+        eprintln!("Replaying: {}", test_name);
+
+        let test_json_str = fs::read_to_string(&test_json_path)
+            .unwrap_or_else(|e| panic!("Failed to read {}: {}", test_json_path.display(), e));
+        let test: JsonTest = serde_json::from_str(&test_json_str)
+            .unwrap_or_else(|e| panic!("Failed to parse {}: {}", test_json_path.display(), e));
+
+        let policy_text = fs::read_to_string(&policy_path)
+            .unwrap_or_else(|e| panic!("Failed to read {}: {}", policy_path.display(), e));
+        let policies = PolicySet::from_str(&policy_text)
+            .unwrap_or_else(|e| panic!("Failed to parse policy in {}: {}", test_name, e));
+
+        let entities_str = fs::read_to_string(&entities_path)
+            .unwrap_or_else(|e| panic!("Failed to read {}: {}", entities_path.display(), e));
+        let entities = Entities::from_json_str(&entities_str, None)
+            .unwrap_or_else(|e| panic!("Failed to parse entities in {}: {}", test_name, e));
+
+        let authorizer = Authorizer::new();
+
+        for json_req in &test.requests {
+            let principal = cedar_policy::EntityUid::from_json(json_req.principal.clone())
+                .unwrap_or_else(|e| panic!("Bad principal in {}: {}", test_name, e));
+            let action = cedar_policy::EntityUid::from_json(json_req.action.clone())
+                .unwrap_or_else(|e| panic!("Bad action in {}: {}", test_name, e));
+            let resource = cedar_policy::EntityUid::from_json(json_req.resource.clone())
+                .unwrap_or_else(|e| panic!("Bad resource in {}: {}", test_name, e));
+            let context = cedar_policy::Context::from_json_value(json_req.context.clone(), None)
+                .unwrap_or_else(|e| panic!("Bad context in {}: {}", test_name, e));
+
+            let request = Request::new(principal, action, resource, context, None)
+                .expect("Failed to build request");
+
+            // Get Rust authorizer result
+            let rust_res = authorizer.is_authorized(&request, &policies, &entities);
+
+            // Get compiler result
+            let compiler_res = compiler_impl.is_authorized(&request, &policies, &entities);
+
+            match compiler_res {
+                TestResult::Failure(err) => {
+                    panic!(
+                        "Replay {}: compiler error: {}\nRequest: {}\nPolicies:\n{}",
+                        test_name, err, request, policies,
+                    );
+                }
+                TestResult::Success(compiler_result) => {
+                    assert_eq!(
+                        rust_res.decision(),
+                        compiler_result.response.decision(),
+                        "Replay {}: decision mismatch\nRequest: {}\nPolicies:\n{}\nRust: {:?}\nCompiler: {:?}",
+                        test_name, request, policies, rust_res.decision(), compiler_result.response.decision(),
+                    );
+                }
+            }
+        }
+        count += 1;
+    }
+    count
 }
 
 /// Randomly drop some of the entities from the list so the generator can produce

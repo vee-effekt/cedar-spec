@@ -18,6 +18,19 @@ Your compiler walks the Cedar expression AST and emits Rust code. It is validate
 
 **Test harness:**
 - `cedar-drt/src/compiler_engine.rs` — how your compiler output gets called
+- `cedar-drt/src/tests.rs` — three-way comparison (Rust vs Lean vs compiler)
+
+## Logging and failure infrastructure
+
+When the compiler disagrees with either interpreter, the failing test case is saved to `fuzz/failures/compiler/` (override with `COMPILER_FAILURES_DIR`). Each failure is a directory containing:
+- `policy.cedar` — the policy text
+- `entities.json` — entities in Cedar JSON format
+- `test.json` — request and expected decision in Cedar integration test format
+
+To replay all saved failures:
+```
+cargo test -p cedar-drt --test replay_compiler_failures
+```
 
 ## Accessing the Cedar AST
 
@@ -49,7 +62,3 @@ Set(elements)           Record(fields)
 ## What to emit
 
 Your compiler emits Rust source code. Walk the expression tree and produce a Rust function body that evaluates the policy against a request and entity store, returning `Value`. Structure the compiler as a recursive `compile_expr` that pattern-matches on `ExprKind` and emits the corresponding Rust code string for each node.
-
-## Output format
-
-Provide the complete contents of each file you change in fenced code blocks. Always give full file contents, not diffs.
