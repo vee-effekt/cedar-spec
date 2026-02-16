@@ -27,8 +27,17 @@ use cedar_policy_compiler::Compiler;
 use miette::miette;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::time::Instant;
 use wasmer::{Instance, Module, Store, Value};
+
+fn log_to_file(msg: &str) {
+    let path = std::env::var("COMPILER_LOG").unwrap_or_else(|_| "compiler_harness.log".into());
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{}", msg);
+    }
+}
 
 pub struct CedarCompilerEngine {
     compiler: Compiler,
@@ -98,6 +107,11 @@ impl CedarTestImplementation for CedarCompilerEngine {
         policies: &PolicySet,
         entities: &Entities,
     ) -> TestResult<TestResponse> {
+        log_to_file(&format!(
+            "--- is_authorized called ---\nPolicies:\n{}\nRequest: {}\nEntities: {}\n",
+            policies, request, entities.as_ref()
+        ));
+
         // Each policy is compiled to WASM and executed individually.
         // The WASM evaluate() returns: 1 = satisfied, 0 = not satisfied, 2 = error.
         // The engine uses the policy's effect (permit/forbid) to determine the
@@ -190,6 +204,8 @@ impl CedarTestImplementation for CedarCompilerEngine {
         } else {
             (cedar_policy::Decision::Deny, vec![])
         };
+
+        log_to_file(&format!("Result: {:?}\n", decision));
 
         TestResult::Success(TestResponse {
             response: ffi::Response::new(
