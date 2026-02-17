@@ -1,8 +1,8 @@
 You are a compiler engineer.
 
-You are implementing a compiler for the Cedar programming language. Cedar is an open-source authorization policy language; the reference implementations below are your oracle for behavior. If you're unsure what any Cedar construct does, read the evaluator source.
+You are implementing a compiler for the Cedar programming language. Cedar is an open-source authorization policy language; the reference implementations below are your oracle for behavior. Familiarize yourself with the contents of `cedar-drt`, and `cedar-lean`, and `cedar` thoroughly.
 
-Your compiler walks the Cedar expression AST and emits Rust code. It is validated by differential testing: random policies, requests, and entity hierarchies are generated and run through (a) the Cedar Rust interpreter, (b) the executable Lean specification, and (c) your compiler. If any of the three disagrees on even a single test case, the test fails.
+Cedar has several interpreters available already, but it lacks a compiler. This is your job to produce. The compiler should emit Rust code equivalent to the original Cedar, which will then be compiled and run as Wasm. It will be validated by differential testing: random policies, requests, and entity hierarchies are generated and run through (a) the Cedar Rust interpreter, (b) the executable Lean specification, and (c) your compiler. If any of the three disagrees on even a single test case, the test fails.
 
 When the compiler disagrees with either interpreter, the failing test case is saved to `cedar-drt/fuzz/failures/compiler/` (override with `COMPILER_FAILURES_DIR`). Each failure is a directory containing:
 - `policy.cedar` — the policy text
@@ -14,18 +14,17 @@ To replay all saved failures:
 cargo test -p cedar-drt --test replay_compiler_failures
 ```
 
-
 ## Reference implementations (your behavioral oracle)
 
 **Rust interpreter:**
-- `cedar-policy-core/src/evaluator.rs` — the expression evaluator
-- `cedar-policy-core/src/authorizer.rs` — the authorization loop
-- `cedar-policy-core/src/ast/policy.rs` — how scope + conditions become a single expression
+- `cedar-drt/cedar-policy-core/src/evaluator.rs` — the expression evaluator
+- `cedar-drt/cedar-policy-core/src/authorizer.rs` — the authorization loop
+- `cedar-drt/cedar-policy-core/src/ast/policy.rs` — how scope + conditions become a single expression
 
 **Lean specification:**
-- `Cedar/Spec/Evaluator.lean` — the expression evaluator
-- `Cedar/Spec/Authorizer.lean` — `isAuthorized`
-- `Cedar/Spec/Policy.lean` — `Policy.toExpr`
+- `cedar-lean/Cedar/Spec/Evaluator.lean` — the expression evaluator
+- `cedar-lean/Cedar/Spec/Authorizer.lean` — `isAuthorized`
+- `cedar-lean/Cedar/Spec/Policy.lean` — `Policy.toExpr`
 
 **Test harness:**
 - `cedar-drt/src/compiler_engine.rs` — how your compiler output gets called
