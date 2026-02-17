@@ -17,6 +17,7 @@
 use cedar_policy::{
     ffi, Effect, Entities, EvalResult, Expression, PolicySet, Request, Schema, ValidationMode,
 };
+use cedar_policy_core::ast as core_ast;
 
 use cedar_testing::cedar_test_impl::{
     CedarTestImplementation, ErrorComparisonMode, Micros, TestResponse, TestResult,
@@ -25,12 +26,10 @@ use cedar_testing::cedar_test_impl::{
 
 use cedar_policy_compiler::Compiler;
 use miette::miette;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::time::Instant;
-use wasmer::{Instance, Module, Store, Value};
 
 fn log_to_file(msg: &str) {
     let path = std::env::var("COMPILER_LOG").unwrap_or_else(|_| "compiler_harness.log".into());
@@ -41,61 +40,12 @@ fn log_to_file(msg: &str) {
 
 pub struct CedarCompilerEngine {
     compiler: Compiler,
-    store: RefCell<Store>,
 }
 
 impl CedarCompilerEngine {
     pub fn new() -> Self {
         Self {
             compiler: Compiler::new(),
-            store: RefCell::new(Store::default()),
-        }
-    }
-
-    /// Helper to compile a policy and measure timing
-    /// Returns the WASM bytes and compilation time in nanoseconds
-    fn compile_policy_timed(&self, policy_text: &str) -> Result<(Vec<u8>, u128), String> {
-        let start = Instant::now();
-        let wasm_bytes = self
-            .compiler
-            .compile_str(policy_text)
-            .map_err(|e| e.to_string())?;
-        let duration = start.elapsed().as_nanos();
-        Ok((wasm_bytes, duration))
-    }
-
-    /// Execute compiled WASM bytecode and return the decision
-    /// Returns (decision as i64, execution time in ns)
-    fn execute_wasm(&self, wasm_bytes: &[u8]) -> Result<(i64, u128), String> {
-        let start = Instant::now();
-        let mut store = self.store.borrow_mut();
-
-        // Compile WASM module
-        let module = Module::new(&*store, wasm_bytes)
-            .map_err(|e| format!("Failed to compile WASM module: {}", e))?;
-
-        // Instantiate the module
-        let instance = Instance::new(&mut *store, &module, &wasmer::imports! {})
-            .map_err(|e| format!("Failed to instantiate WASM module: {}", e))?;
-
-        // Get the exported "evaluate" function
-        let evaluate = instance
-            .exports
-            .get_function("evaluate")
-            .map_err(|e| format!("Failed to get evaluate function: {}", e))?;
-
-        // Call the function (no arguments for now)
-        let result = evaluate
-            .call(&mut *store, &[])
-            .map_err(|e| format!("Failed to execute WASM function: {}", e))?;
-
-        let duration = start.elapsed().as_nanos();
-
-        // Extract the i64 result (Decision)
-        match result.first() {
-            Some(Value::I64(decision)) => Ok((*decision, duration)),
-            Some(other) => Err(format!("Unexpected return type: {:?}", other)),
-            None => Err("No return value from evaluate function".to_string()),
         }
     }
 }
@@ -114,89 +64,52 @@ impl CedarTestImplementation for CedarCompilerEngine {
             entities.as_ref()
         ));
 
-        // Each policy is compiled to WASM and executed individually.
-        // The WASM evaluate() returns: 1 = satisfied, 0 = not satisfied, 2 = error.
-        // The engine uses the policy's effect (permit/forbid) to determine the
-        // overall authorization decision per Cedar semantics:
-        //   - If any satisfied forbid → Deny (forbid overrides permit)
-        //   - Else if any satisfied permit → Allow
-        //   - Else → Deny (default deny)
-
-        let mut compile_time_total = 0u128;
         let mut eval_time_total = 0u128;
         let mut satisfied_permits = vec![];
         let mut satisfied_forbids = vec![];
         let mut errors = vec![];
 
-        // Compile and execute each policy
-        for policy in policies.policies() {
+        // Access the core PolicySet to get condition expressions directly,
+        // avoiding text round-trip parsing issues
+        let core_policy_set: &core_ast::PolicySet = policies.as_ref();
+
+        for (policy, core_policy) in policies.policies().zip(core_policy_set.policies()) {
             let policy_id = policy.id();
-            let policy_text = policy.to_string();
             let is_forbid = policy.effect() == Effect::Forbid;
+            let condition = core_policy.condition();
 
-            // Compile the policy
-            let wasm_bytes = match self.compile_policy_timed(&policy_text) {
-                Ok((bytes, compile_time)) => {
-                    compile_time_total += compile_time;
-                    bytes
-                }
-                Err(err) => {
-                    // Compilation failure is a bug in the compiler, not an authorization error
-                    return TestResult::Failure(format!(
-                        "Failed to compile policy {}: {}",
-                        policy_id, err
-                    ));
-                }
-            };
+            let start = Instant::now();
+            let decision = self
+                .compiler
+                .evaluate_condition(&condition, request, entities);
+            let duration = start.elapsed().as_nanos();
+            eval_time_total += duration;
 
-            // Execute the WASM
-            match self.execute_wasm(&wasm_bytes) {
-                Ok((decision_value, exec_time)) => {
-                    eval_time_total += exec_time;
-
-                    // WASM return values:
-                    // 1 = policy is satisfied (scope + conditions match)
-                    // 0 = policy is not satisfied
-                    // 2 = error during evaluation
-                    match decision_value {
-                        1 => {
-                            // Policy is satisfied — file under permit or forbid
-                            if is_forbid {
-                                satisfied_forbids.push(policy_id.clone());
-                            } else {
-                                satisfied_permits.push(policy_id.clone());
-                            }
-                        }
-                        0 => {
-                            // Policy not satisfied — no contribution to decision
-                        }
-                        2 => {
-                            // Error during evaluation
-                            errors.push(ffi::AuthorizationError::new_from_report(
-                                policy_id.clone(),
-                                miette!("Policy evaluation returned error"),
-                            ));
-                        }
-                        _ => {
-                            // Unknown decision value is a compiler bug
-                            return TestResult::Failure(format!(
-                                "Policy {} returned unknown decision value: {}",
-                                policy_id, decision_value
-                            ));
-                        }
+            match decision {
+                1 => {
+                    if is_forbid {
+                        satisfied_forbids.push(policy_id.clone());
+                    } else {
+                        satisfied_permits.push(policy_id.clone());
                     }
                 }
-                Err(err) => {
-                    // Execution failure (e.g., WASM validation error) is a compiler bug
+                0 => {
+                    // Policy not satisfied — no contribution to decision
+                }
+                2 => {
+                    errors.push(ffi::AuthorizationError::new_from_report(
+                        policy_id.clone(),
+                        miette!("{}", policy_id),
+                    ));
+                }
+                n => {
                     return TestResult::Failure(format!(
-                        "Failed to execute WASM for policy {}: {}",
-                        policy_id, err
+                        "Policy {} returned unknown decision value: {}",
+                        policy_id, n
                     ));
                 }
             }
         }
-
-        let total_time = compile_time_total + eval_time_total;
 
         // Cedar authorization semantics: forbid overrides permit
         let (decision, determining_policies) = if !satisfied_forbids.is_empty() {
@@ -216,9 +129,8 @@ impl CedarTestImplementation for CedarCompilerEngine {
                 errors.into_iter().collect(),
             ),
             timing_info: HashMap::from([
-                ("compile".into(), Micros(compile_time_total / 1000)),
                 ("evaluate".into(), Micros(eval_time_total / 1000)),
-                ("authorize".into(), Micros(total_time / 1000)),
+                ("authorize".into(), Micros(eval_time_total / 1000)),
             ]),
         })
     }

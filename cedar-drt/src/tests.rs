@@ -218,7 +218,7 @@ fn save_failure(
         errors: rust_response
             .diagnostics()
             .errors()
-            .map(|e| e.policy_id().clone())
+            .map(|e| e.policy_id.clone())
             .collect(),
     };
 

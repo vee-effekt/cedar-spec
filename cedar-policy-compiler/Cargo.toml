@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+cedar-policy = "4.4.0"
+cedar-policy-core = { version = "4.4.0", features = ["arbitrary"] }
+smol_str = "0.3"
+
+[patch.crates-io]
+cedar-policy = { path = "../cedar/cedar-policy" }
+cedar-policy-core = { path = "../cedar/cedar-policy-core" }
