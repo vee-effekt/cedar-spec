@@ -17,26 +17,19 @@
 use cedar_policy::{
     ffi, Effect, Entities, EvalResult, Expression, PolicySet, Request, Schema, ValidationMode,
 };
-use cedar_policy_core::ast as core_ast;
+use cedar_policy_core::ast;
+use cedar_policy_core::entities::Entities as CoreEntities;
 
 use cedar_testing::cedar_test_impl::{
     CedarTestImplementation, ErrorComparisonMode, Micros, TestResponse, TestResult,
     TestValidationResult, ValidationComparisonMode,
 };
 
+use cedar_policy_compiler::helpers::RuntimeCtx;
 use cedar_policy_compiler::Compiler;
 use miette::miette;
 use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::time::Instant;
-
-fn log_to_file(msg: &str) {
-    let path = std::env::var("COMPILER_LOG").unwrap_or_else(|_| "compiler_harness.log".into());
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "{}", msg);
-    }
-}
 
 pub struct CedarCompilerEngine {
     compiler: Compiler,
@@ -57,61 +50,65 @@ impl CedarTestImplementation for CedarCompilerEngine {
         policies: &PolicySet,
         entities: &Entities,
     ) -> TestResult<TestResponse> {
-        log_to_file(&format!(
-            "--- is_authorized called ---\nPolicies:\n{}\nRequest: {}\nEntities: {}\n",
-            policies,
-            request,
-            entities.as_ref()
-        ));
+        let start = Instant::now();
 
-        let mut eval_time_total = 0u128;
+        let core_pset: &ast::PolicySet = policies.as_ref();
+        let conditions: Vec<ast::Expr> = core_pset.policies().map(|p| p.condition()).collect();
+
+        let compiled = match self.compiler.compile_conditions(&conditions) {
+            Ok(c) => c,
+            Err(e) => return TestResult::Failure(format!("Compilation error: {}", e)),
+        };
+
+        // Create runtime context with request and entities
+        let core_request: &ast::Request = request.as_ref();
+        let core_entities: &CoreEntities = entities.as_ref();
+        let runtime_ctx = RuntimeCtx::new(
+            core_request,
+            core_entities,
+            compiled.patterns.clone(),
+            compiled.interned_strings.clone(),
+            compiled.string_pool.clone(),
+        );
+        let ctx_ptr = &runtime_ctx as *const RuntimeCtx;
+
         let mut satisfied_permits = vec![];
         let mut satisfied_forbids = vec![];
         let mut errors = vec![];
 
-        // Access the core PolicySet to get condition expressions directly,
-        // avoiding text round-trip parsing issues
-        let core_policy_set: &core_ast::PolicySet = policies.as_ref();
+        for (i, (policy, _core_policy)) in policies.policies().zip(core_pset.policies()).enumerate() {
+            let decision = compiled.call(i, ctx_ptr);
 
-        for (policy, core_policy) in policies.policies().zip(core_policy_set.policies()) {
-            let policy_id = policy.id();
-            let is_forbid = policy.effect() == Effect::Forbid;
-            let condition = core_policy.condition();
-
-            let start = Instant::now();
-            let decision = self
-                .compiler
-                .evaluate_condition(&condition, request, entities);
-            let duration = start.elapsed().as_nanos();
-            eval_time_total += duration;
+            if std::env::var("COMPILER_DEBUG").is_ok() {
+                eprintln!("  evaluate_{} returned: {}", i, decision);
+            }
 
             match decision {
                 1 => {
-                    if is_forbid {
-                        satisfied_forbids.push(policy_id.clone());
+                    if policy.effect() == Effect::Forbid {
+                        satisfied_forbids.push(policy.id().clone());
                     } else {
-                        satisfied_permits.push(policy_id.clone());
+                        satisfied_permits.push(policy.id().clone());
                     }
                 }
-                0 => {
-                    // Policy not satisfied — no contribution to decision
-                }
+                0 => { /* not satisfied */ }
                 2 => {
                     errors.push(ffi::AuthorizationError::new_from_report(
-                        policy_id.clone(),
-                        miette!("{}", policy_id),
+                        policy.id().clone(),
+                        miette!("{}", policy.id()),
                     ));
                 }
                 n => {
                     return TestResult::Failure(format!(
                         "Policy {} returned unknown decision value: {}",
-                        policy_id, n
+                        policy.id(), n
                     ));
                 }
             }
         }
 
-        // Cedar authorization semantics: forbid overrides permit
+        let duration = start.elapsed().as_nanos();
+
         let (decision, determining_policies) = if !satisfied_forbids.is_empty() {
             (cedar_policy::Decision::Deny, satisfied_forbids)
         } else if !satisfied_permits.is_empty() {
@@ -120,8 +117,6 @@ impl CedarTestImplementation for CedarCompilerEngine {
             (cedar_policy::Decision::Deny, vec![])
         };
 
-        log_to_file(&format!("Result: {:?}\n", decision));
-
         TestResult::Success(TestResponse {
             response: ffi::Response::new(
                 decision,
@@ -129,16 +124,12 @@ impl CedarTestImplementation for CedarCompilerEngine {
                 errors.into_iter().collect(),
             ),
             timing_info: HashMap::from([
-                ("evaluate".into(), Micros(eval_time_total / 1000)),
-                ("authorize".into(), Micros(eval_time_total / 1000)),
+                ("evaluate".into(), Micros(duration / 1000)),
+                ("authorize".into(), Micros(duration / 1000)),
             ]),
         })
     }
 
-    /// Custom evaluator entry point. The bool return value indicates whether
-    /// evaluating the provided expression produces the expected value.
-    /// `expected` is optional to allow for the case where no return value is
-    /// expected due to errors.
     fn interpret(
         &self,
         request: &Request,
@@ -146,21 +137,16 @@ impl CedarTestImplementation for CedarCompilerEngine {
         expr: &Expression,
         expected: Option<EvalResult>,
     ) -> TestResult<bool> {
-        // For now, the compiler doesn't have a separate expression evaluator
-        // We'll fall back to the standard evaluator
         let result = cedar_policy::eval_expression(request, entities, expr).ok();
         TestResult::Success(result == expected)
     }
 
-    /// Custom validator entry point.
     fn validate(
         &self,
         schema: &Schema,
         policies: &PolicySet,
         mode: ValidationMode,
     ) -> TestResult<TestValidationResult> {
-        // The compiler doesn't currently have a separate validator
-        // We'll use the standard validator from cedar-policy
         let validator = cedar_policy::Validator::new(schema.clone());
         let start = Instant::now();
         let result = validator.validate(policies, mode);
@@ -178,7 +164,6 @@ impl CedarTestImplementation for CedarCompilerEngine {
         })
     }
 
-    /// Custom validator entry point with level.
     fn validate_with_level(
         &self,
         schema: &Schema,
@@ -186,7 +171,6 @@ impl CedarTestImplementation for CedarCompilerEngine {
         mode: ValidationMode,
         level: i32,
     ) -> TestResult<TestValidationResult> {
-        // The compiler doesn't currently have a separate validator
         let validator = cedar_policy::Validator::new(schema.clone());
         let start = Instant::now();
         let result = validator.validate_with_level(policies, mode, level as u32);
@@ -252,12 +236,10 @@ impl CedarTestImplementation for CedarCompilerEngine {
         })
     }
 
-    /// `ErrorComparisonMode` that should be used for this `CedarTestImplementation`
     fn error_comparison_mode(&self) -> ErrorComparisonMode {
         ErrorComparisonMode::PolicyIds
     }
 
-    /// `ValidationComparisonMode` that should be used for this `CedarTestImplementation`
     fn validation_comparison_mode(&self) -> ValidationComparisonMode {
         ValidationComparisonMode::AgreeOnValid
     }
