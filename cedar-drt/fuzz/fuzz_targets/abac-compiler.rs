@@ -25,7 +25,7 @@ use cedar_drt::{
 
 use cedar_drt_inner::{abac::FuzzTargetInput, fuzz_target};
 
-use cedar_policy::{Authorizer, Policy, PolicyId, PolicySet, Request, SchemaFragment};
+use cedar_policy::{Authorizer, Policy, PolicyId, PolicySet, Request, Schema, SchemaFragment};
 
 use cedar_testing::cedar_test_impl::time_function;
 
@@ -49,6 +49,13 @@ fuzz_target!(|input: FuzzTargetInput<false>| {
 
     let lean_engine = CedarLeanEngine::new();
     let compiler_engine = CedarCompilerEngine::new();
+
+    // Pass schema to compiler engine for schema-directed compilation
+    if let Ok(schema_fragment) = SchemaFragment::try_from(input.schema.clone()) {
+        if let Ok(schema) = Schema::from_schema_fragments([schema_fragment]) {
+            compiler_engine.set_schema(&schema);
+        }
+    }
 
     for request in requests.iter().cloned() {
         debug!("Request: {request}");

@@ -1,9 +1,11 @@
 pub mod helpers;
+pub mod layout;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::sync::Arc;
 
-use cedar_policy_core::ast::{self, BinaryOp, ExprKind, Literal, UnaryOp, Var};
+use cedar_policy_core::ast::{self, BinaryOp, EntityType, ExprKind, Literal, PrincipalOrResourceConstraint, UnaryOp, Var};
 use cranelift::prelude::*;
 use cranelift_codegen::ir::{Function, SigRef};
 use cranelift_codegen::settings;
@@ -12,6 +14,7 @@ use cranelift_module::{FuncId, Module, Linkage};
 use smol_str::SmolStr;
 
 use helpers::RuntimeCtx;
+use layout::{SchemaLayout, SlotType};
 
 /// C-compatible tagged value for passing data between JIT code and helpers.
 #[repr(C)]
@@ -19,6 +22,50 @@ pub struct TaggedValue {
     pub tag: u32,
     pub _pad: u32,
     pub payload: u64,
+}
+
+// Tag constants — must match helpers.rs
+const TAG_ERROR: i64 = 0;
+const TAG_BOOL: i64 = 1;
+const TAG_LONG: i64 = 2;
+// const TAG_VALUE: i64 = 3; // complex types (String, EntityUID, Set, Record, Extension)
+
+/// Compile-time tracking of where a value lives.
+/// This is NOT stored at runtime — it describes the Cranelift ir::Value.
+#[derive(Copy, Clone)]
+enum CompiledValue {
+    /// A boolean in a register (i8, 0 or 1)
+    Bool(cranelift_codegen::ir::Value),
+    /// A 64-bit signed integer in a register
+    Long(cranelift_codegen::ir::Value),
+    /// A pointer to a TaggedValue struct (stack or heap)
+    Tagged(cranelift_codegen::ir::Value),
+    /// Statically known error — no runtime value exists yet
+    Error,
+}
+
+impl CompiledValue {
+    /// Box this value into a stack-allocated TaggedValue, returning a pointer.
+    fn to_tagged(
+        self,
+        builder: &mut FunctionBuilder,
+        ptr_type: Type,
+    ) -> cranelift_codegen::ir::Value {
+        match self {
+            CompiledValue::Bool(v) => {
+                let payload = builder.ins().uextend(types::I64, v);
+                emit_tagged(builder, TAG_BOOL, payload, ptr_type)
+            }
+            CompiledValue::Long(v) => {
+                emit_tagged(builder, TAG_LONG, v, ptr_type)
+            }
+            CompiledValue::Tagged(ptr) => ptr,
+            CompiledValue::Error => {
+                let zero = builder.ins().iconst(types::I64, 0);
+                emit_tagged(builder, TAG_ERROR, zero, ptr_type)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -38,6 +85,7 @@ pub struct CompiledConditions {
     pub string_pool: Vec<u8>,
     pub interned_strings: Vec<(SmolStr, usize)>,
     pub condition_count: usize,
+    pub schema_layout: Option<Arc<SchemaLayout>>,
 }
 
 unsafe impl Send for CompiledConditions {}
@@ -53,6 +101,25 @@ impl CompiledConditions {
     }
 }
 
+/// Per-policy type information extracted from scope constraints.
+struct PolicyTypeCtx {
+    principal_type: Option<EntityType>,
+    resource_type: Option<EntityType>,
+    schema_layout: Option<Arc<SchemaLayout>>,
+}
+
+/// Extract entity type from a scope constraint (principal or resource).
+fn extract_entity_type(constraint: &PrincipalOrResourceConstraint) -> Option<EntityType> {
+    match constraint {
+        PrincipalOrResourceConstraint::Is(ty) => Some((**ty).clone()),
+        PrincipalOrResourceConstraint::IsIn(ty, _) => Some((**ty).clone()),
+        PrincipalOrResourceConstraint::Eq(ast::EntityReference::EUID(uid)) => {
+            Some(uid.entity_type().clone())
+        }
+        _ => None,
+    }
+}
+
 pub struct Compiler;
 
 impl Compiler {
@@ -62,13 +129,20 @@ impl Compiler {
 
     pub fn compile_conditions(
         &self,
-        conditions: &[ast::Expr],
+        policies: &[&ast::Policy],
+        schema: Option<&cedar_policy::Schema>,
     ) -> Result<CompiledConditions, CompileError> {
         let mut codegen_ctx = CodeGenContext::new();
 
+        // Build schema layout if schema is available
+        let schema_layout = schema.map(|s| {
+            let vs: &cedar_policy_core::validator::ValidatorSchema = s.as_ref();
+            Arc::new(SchemaLayout::from_schema(vs))
+        });
+
         // Pre-walk all conditions to intern strings and register patterns
-        for condition in conditions {
-            codegen_ctx.prewalk(condition);
+        for policy in policies {
+            codegen_ctx.prewalk(&policy.condition());
         }
 
         // Set up Cranelift JIT with is_pic=false to avoid PLT (unsupported on aarch64)
@@ -89,13 +163,24 @@ impl Compiler {
 
         // Compile each condition into a separate function
         let mut func_ids = Vec::new();
-        for (i, condition) in conditions.iter().enumerate() {
+        for (i, policy) in policies.iter().enumerate() {
+            // Extract principal/resource entity types from scope constraints
+            let principal_type = extract_entity_type(policy.principal_constraint().as_inner());
+            let resource_type = extract_entity_type(policy.resource_constraint().as_inner());
+
+            let policy_ctx = PolicyTypeCtx {
+                principal_type,
+                resource_type,
+                schema_layout: schema_layout.clone(),
+            };
+
             let func_id = compile_one_condition(
                 &mut module,
                 &mut codegen_ctx,
-                condition,
+                &policy.condition(),
                 i,
                 ptr_type,
+                &policy_ctx,
             )?;
             func_ids.push(func_id);
         }
@@ -117,7 +202,8 @@ impl Compiler {
             patterns: codegen_ctx.patterns,
             string_pool: codegen_ctx.string_pool,
             interned_strings: interned,
-            condition_count: conditions.len(),
+            condition_count: policies.len(),
+            schema_layout,
         })
     }
 }
@@ -453,12 +539,47 @@ fn icall(
     builder.inst_results(call)[0]
 }
 
+/// Allocate a 16-byte TaggedValue on the stack and return its address.
+fn emit_tagged(
+    builder: &mut FunctionBuilder,
+    tag: i64,
+    payload: cranelift_codegen::ir::Value,
+    ptr_type: Type,
+) -> cranelift_codegen::ir::Value {
+    let slot = builder.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot, 16, 3,
+    ));
+    let tag_val = builder.ins().iconst(types::I32, tag);
+    let pad = builder.ins().iconst(types::I32, 0);
+    builder.ins().stack_store(tag_val, slot, 0);
+    builder.ins().stack_store(pad, slot, 4);
+    builder.ins().stack_store(payload, slot, 8);
+    builder.ins().stack_addr(ptr_type, slot, 0)
+}
+
+/// Load the tag field (offset 0, I32) from a TaggedValue pointer.
+fn emit_load_tag(
+    builder: &mut FunctionBuilder,
+    ptr: cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    builder.ins().load(types::I32, MemFlags::new(), ptr, 0)
+}
+
+/// Load the payload field (offset 8, I64) from a TaggedValue pointer.
+fn emit_load_payload(
+    builder: &mut FunctionBuilder,
+    ptr: cranelift_codegen::ir::Value,
+) -> cranelift_codegen::ir::Value {
+    builder.ins().load(types::I64, MemFlags::new(), ptr, 8)
+}
+
 fn compile_one_condition(
     module: &mut JITModule,
     codegen_ctx: &mut CodeGenContext,
     condition: &ast::Expr,
     index: usize,
     ptr_type: Type,
+    policy_ctx: &PolicyTypeCtx,
 ) -> Result<FuncId, CompileError> {
     let mut sig = module.make_signature();
     sig.params.push(AbiParam::new(ptr_type));
@@ -486,49 +607,88 @@ fn compile_one_condition(
 
         let ctx_val = builder.block_params(entry_block)[0];
 
-        let result_ptr = compile_expr(
-            &mut builder, codegen_ctx, &hsigs, condition, ctx_val, ptr_type,
+        let result = compile_expr(
+            &mut builder, codegen_ctx, &hsigs, condition, ctx_val, ptr_type, policy_ctx,
         );
 
-        // Convert result to i32: is_error → 2, is_bool && get_bool → 1, else → 0
-        let is_err = icall(&mut builder, hsigs.sig_ptr_to_u64, hsigs.addr_is_error, &[result_ptr], ptr_type);
-        let zero_i64 = builder.ins().iconst(types::I64, 0);
-        let err_cmp = builder.ins().icmp(IntCC::NotEqual, is_err, zero_i64);
+        // Convert result to i32: error → 2, bool(true) → 1, bool(false) → 0
+        match result {
+            CompiledValue::Bool(v) => {
+                // Unboxed bool — direct branch, no tag checks at all
+                let return_true_block = builder.create_block();
+                let return_false_block = builder.create_block();
+                builder.ins().brif(v, return_true_block, &[], return_false_block, &[]);
 
-        let not_error_block = builder.create_block();
-        let return_error_block = builder.create_block();
-        let return_true_block = builder.create_block();
-        let return_false_block = builder.create_block();
+                builder.switch_to_block(return_true_block);
+                builder.seal_block(return_true_block);
+                let one = builder.ins().iconst(types::I32, 1);
+                builder.ins().return_(&[one]);
 
-        builder.ins().brif(err_cmp, return_error_block, &[], not_error_block, &[]);
+                builder.switch_to_block(return_false_block);
+                builder.seal_block(return_false_block);
+                let zero = builder.ins().iconst(types::I32, 0);
+                builder.ins().return_(&[zero]);
+            }
+            CompiledValue::Long(_) | CompiledValue::Error => {
+                // Type error or static error — return 2
+                let two = builder.ins().iconst(types::I32, 2);
+                builder.ins().return_(&[two]);
+            }
+            CompiledValue::Tagged(result_ptr) => {
+                // Full tag-check path (existing logic)
+                let return_error_block = builder.create_block();
+                let return_true_block = builder.create_block();
+                let return_false_block = builder.create_block();
 
-        builder.switch_to_block(not_error_block);
-        builder.seal_block(not_error_block);
-        let is_bool_val = icall(&mut builder, hsigs.sig_ptr_to_u64, hsigs.addr_is_bool, &[result_ptr], ptr_type);
-        let bool_cmp = builder.ins().icmp(IntCC::Equal, is_bool_val, zero_i64);
-        let is_bool_block = builder.create_block();
-        builder.ins().brif(bool_cmp, return_error_block, &[], is_bool_block, &[]);
+                let tag = emit_load_tag(&mut builder, result_ptr);
 
-        builder.switch_to_block(is_bool_block);
-        builder.seal_block(is_bool_block);
-        let bool_val = icall(&mut builder, hsigs.sig_ptr_to_u64, hsigs.addr_get_bool, &[result_ptr], ptr_type);
-        let true_cmp = builder.ins().icmp(IntCC::NotEqual, bool_val, zero_i64);
-        builder.ins().brif(true_cmp, return_true_block, &[], return_false_block, &[]);
+                let is_err = builder.ins().icmp_imm(IntCC::Equal, tag, TAG_ERROR);
+                let not_err_block = builder.create_block();
+                builder.ins().brif(is_err, return_error_block, &[], not_err_block, &[]);
 
-        builder.switch_to_block(return_error_block);
-        builder.seal_block(return_error_block);
-        let two = builder.ins().iconst(types::I32, 2);
-        builder.ins().return_(&[two]);
+                builder.switch_to_block(not_err_block);
+                builder.seal_block(not_err_block);
+                let is_bool = builder.ins().icmp_imm(IntCC::Equal, tag, TAG_BOOL);
+                let fast_bool_block = builder.create_block();
+                let slow_path_block = builder.create_block();
+                builder.ins().brif(is_bool, fast_bool_block, &[], slow_path_block, &[]);
 
-        builder.switch_to_block(return_true_block);
-        builder.seal_block(return_true_block);
-        let one = builder.ins().iconst(types::I32, 1);
-        builder.ins().return_(&[one]);
+                builder.switch_to_block(fast_bool_block);
+                builder.seal_block(fast_bool_block);
+                let payload = emit_load_payload(&mut builder, result_ptr);
+                let is_true = builder.ins().icmp_imm(IntCC::NotEqual, payload, 0);
+                builder.ins().brif(is_true, return_true_block, &[], return_false_block, &[]);
 
-        builder.switch_to_block(return_false_block);
-        builder.seal_block(return_false_block);
-        let zero = builder.ins().iconst(types::I32, 0);
-        builder.ins().return_(&[zero]);
+                builder.switch_to_block(slow_path_block);
+                builder.seal_block(slow_path_block);
+                let is_bool_val = icall(&mut builder, hsigs.sig_ptr_to_u64, hsigs.addr_is_bool, &[result_ptr], ptr_type);
+                let zero_i64 = builder.ins().iconst(types::I64, 0);
+                let not_bool = builder.ins().icmp(IntCC::Equal, is_bool_val, zero_i64);
+                let slow_bool_block = builder.create_block();
+                builder.ins().brif(not_bool, return_error_block, &[], slow_bool_block, &[]);
+
+                builder.switch_to_block(slow_bool_block);
+                builder.seal_block(slow_bool_block);
+                let bool_val = icall(&mut builder, hsigs.sig_ptr_to_u64, hsigs.addr_get_bool, &[result_ptr], ptr_type);
+                let slow_true = builder.ins().icmp(IntCC::NotEqual, bool_val, zero_i64);
+                builder.ins().brif(slow_true, return_true_block, &[], return_false_block, &[]);
+
+                builder.switch_to_block(return_error_block);
+                builder.seal_block(return_error_block);
+                let two = builder.ins().iconst(types::I32, 2);
+                builder.ins().return_(&[two]);
+
+                builder.switch_to_block(return_true_block);
+                builder.seal_block(return_true_block);
+                let one = builder.ins().iconst(types::I32, 1);
+                builder.ins().return_(&[one]);
+
+                builder.switch_to_block(return_false_block);
+                builder.seal_block(return_false_block);
+                let zero = builder.ins().iconst(types::I32, 0);
+                builder.ins().return_(&[zero]);
+            }
+        }
 
         builder.finalize();
     }
@@ -548,22 +708,23 @@ fn compile_expr(
     expr: &ast::Expr,
     ctx_val: cranelift_codegen::ir::Value,
     ptr_type: Type,
-) -> cranelift_codegen::ir::Value {
+    policy_ctx: &PolicyTypeCtx,
+) -> CompiledValue {
     match expr.expr_kind() {
         ExprKind::Lit(lit) => match lit {
             Literal::Bool(b) => {
-                let v = builder.ins().iconst(types::I64, if *b { 1 } else { 0 });
-                icall(builder, h.sig_u64_to_ptr, h.addr_lit_bool, &[v], ptr_type)
+                let v = builder.ins().iconst(types::I8, if *b { 1 } else { 0 });
+                CompiledValue::Bool(v)
             }
             Literal::Long(i) => {
                 let v = builder.ins().iconst(types::I64, *i);
-                icall(builder, h.sig_u64_to_ptr, h.addr_lit_long, &[v], ptr_type)
+                CompiledValue::Long(v)
             }
             Literal::String(s) => {
                 let (off, len) = ctx.intern_string(s.as_str());
                 let off_v = builder.ins().iconst(types::I64, off as i64);
                 let len_v = builder.ins().iconst(types::I64, len as i64);
-                icall(builder, h.sig_ctx_3u64_to_ptr, h.addr_lit_string, &[ctx_val, off_v, len_v], ptr_type)
+                CompiledValue::Tagged(icall(builder, h.sig_ctx_3u64_to_ptr, h.addr_lit_string, &[ctx_val, off_v, len_v], ptr_type))
             }
             Literal::EntityUID(uid) => {
                 let type_str = uid.entity_type().to_string();
@@ -574,7 +735,7 @@ fn compile_expr(
                 let tl_v = builder.ins().iconst(types::I64, tl as i64);
                 let io_v = builder.ins().iconst(types::I64, io as i64);
                 let il_v = builder.ins().iconst(types::I64, il as i64);
-                icall(builder, h.sig_ctx_5u64_to_ptr, h.addr_lit_entity, &[ctx_val, to_v, tl_v, io_v, il_v], ptr_type)
+                CompiledValue::Tagged(icall(builder, h.sig_ctx_5u64_to_ptr, h.addr_lit_entity, &[ctx_val, to_v, tl_v, io_v, il_v], ptr_type))
             }
         },
 
@@ -585,85 +746,355 @@ fn compile_expr(
                 Var::Resource => h.addr_var_resource,
                 Var::Context => h.addr_var_context,
             };
-            icall(builder, h.sig_ctx_to_ptr, addr, &[ctx_val], ptr_type)
+            CompiledValue::Tagged(icall(builder, h.sig_ctx_to_ptr, addr, &[ctx_val], ptr_type))
         }
 
         ExprKind::And { left, right } => {
-            compile_and(builder, ctx, h, left, right, ctx_val, ptr_type)
+            compile_and(builder, ctx, h, left, right, ctx_val, ptr_type, policy_ctx)
         }
 
         ExprKind::Or { left, right } => {
-            compile_or(builder, ctx, h, left, right, ctx_val, ptr_type)
+            compile_or(builder, ctx, h, left, right, ctx_val, ptr_type, policy_ctx)
         }
 
         ExprKind::If { test_expr, then_expr, else_expr } => {
-            compile_if(builder, ctx, h, test_expr, then_expr, else_expr, ctx_val, ptr_type)
+            compile_if(builder, ctx, h, test_expr, then_expr, else_expr, ctx_val, ptr_type, policy_ctx)
         }
 
         ExprKind::UnaryApp { op, arg } => {
-            compile_unary(builder, ctx, h, *op, arg, ctx_val, ptr_type)
+            compile_unary(builder, ctx, h, *op, arg, ctx_val, ptr_type, policy_ctx)
         }
 
         ExprKind::BinaryApp { op, arg1, arg2 } => {
-            compile_binary(builder, ctx, h, *op, arg1, arg2, ctx_val, ptr_type)
+            compile_binary(builder, ctx, h, *op, arg1, arg2, ctx_val, ptr_type, policy_ctx)
         }
 
         ExprKind::GetAttr { expr: inner, attr } => {
+            // Try schema-directed direct load for principal/resource attributes
+            if let Some(cv) = try_compile_flat_get_attr(builder, inner, attr, ctx_val, ptr_type, policy_ctx) {
+                return cv;
+            }
+            // Fallback: helper call
             let (off, len) = ctx.intern_string(attr.as_str());
-            compile_with_error_check(builder, ctx, h, inner, ctx_val, ptr_type, |b, val, pt| {
+            CompiledValue::Tagged(compile_with_error_check(builder, ctx, h, inner, ctx_val, ptr_type, policy_ctx, |b, val, pt| {
                 let off_v = b.ins().iconst(types::I64, off as i64);
                 let len_v = b.ins().iconst(types::I64, len as i64);
                 icall(b, h.sig_ptr_ptr_2u64_to_ptr, h.addr_get_attr, &[val, ctx_val, off_v, len_v], pt)
-            })
+            }))
         }
 
         ExprKind::HasAttr { expr: inner, attr } => {
+            // Try schema-directed constant fold for required attributes
+            if let Some(cv) = try_compile_flat_has_attr(builder, inner, attr, ctx_val, ptr_type, policy_ctx) {
+                return cv;
+            }
+            // Fallback: helper call
             let (off, len) = ctx.intern_string(attr.as_str());
-            compile_with_error_check(builder, ctx, h, inner, ctx_val, ptr_type, |b, val, pt| {
+            CompiledValue::Tagged(compile_with_error_check(builder, ctx, h, inner, ctx_val, ptr_type, policy_ctx, |b, val, pt| {
                 let off_v = b.ins().iconst(types::I64, off as i64);
                 let len_v = b.ins().iconst(types::I64, len as i64);
                 icall(b, h.sig_ptr_ptr_2u64_to_ptr, h.addr_has_attr, &[val, ctx_val, off_v, len_v], pt)
-            })
+            }))
         }
 
         ExprKind::Like { expr: inner, pattern } => {
             let pid = ctx.register_pattern(pattern);
-            compile_with_error_check(builder, ctx, h, inner, ctx_val, ptr_type, |b, val, pt| {
+            CompiledValue::Tagged(compile_with_error_check(builder, ctx, h, inner, ctx_val, ptr_type, policy_ctx, |b, val, pt| {
                 let pid_v = b.ins().iconst(types::I64, pid as i64);
                 icall(b, h.sig_ptr_ptr_u64_to_ptr, h.addr_like, &[val, ctx_val, pid_v], pt)
-            })
+            }))
         }
 
         ExprKind::Is { expr: inner, entity_type, .. } => {
             let type_str = entity_type.to_string();
             let (off, len) = ctx.intern_string(&type_str);
-            compile_with_error_check(builder, ctx, h, inner, ctx_val, ptr_type, |b, val, pt| {
+            CompiledValue::Tagged(compile_with_error_check(builder, ctx, h, inner, ctx_val, ptr_type, policy_ctx, |b, val, pt| {
                 let off_v = b.ins().iconst(types::I64, off as i64);
                 let len_v = b.ins().iconst(types::I64, len as i64);
                 icall(b, h.sig_ptr_ptr_2u64_to_ptr, h.addr_is_entity_type, &[val, ctx_val, off_v, len_v], pt)
-            })
+            }))
         }
 
         ExprKind::Set(elements) => {
-            compile_set(builder, ctx, h, elements, ctx_val, ptr_type)
+            CompiledValue::Tagged(compile_set(builder, ctx, h, elements, ctx_val, ptr_type, policy_ctx))
         }
 
         ExprKind::Record(fields) => {
-            compile_record(builder, ctx, h, fields.as_ref(), ctx_val, ptr_type)
+            CompiledValue::Tagged(compile_record(builder, ctx, h, fields.as_ref(), ctx_val, ptr_type, policy_ctx))
         }
 
         ExprKind::ExtensionFunctionApp { fn_name, args } => {
-            compile_ext_call(builder, ctx, h, fn_name, args, ctx_val, ptr_type)
+            CompiledValue::Tagged(compile_ext_call(builder, ctx, h, fn_name, args, ctx_val, ptr_type, policy_ctx))
         }
 
         ExprKind::Slot(_) | ExprKind::Unknown(_) => {
-            icall(builder, h.sig_void_to_ptr, h.addr_error, &[], ptr_type)
+            CompiledValue::Error
         }
+    }
+}
+
+/// Try to compile `GetAttr(Var(Principal/Resource), attr)` as a direct memory load
+/// from the flat entity data when schema info is available.
+/// Returns None if the pattern doesn't match or schema info is insufficient.
+fn try_compile_flat_get_attr(
+    builder: &mut FunctionBuilder,
+    inner: &ast::Expr,
+    attr: &SmolStr,
+    ctx_val: cranelift_codegen::ir::Value,
+    ptr_type: Type,
+    policy_ctx: &PolicyTypeCtx,
+) -> Option<CompiledValue> {
+    let schema_layout = policy_ctx.schema_layout.as_ref()?;
+
+    // Check if inner is Var(Principal) or Var(Resource)
+    let (entity_type, data_offset) = match inner.expr_kind() {
+        ExprKind::Var(Var::Principal) => {
+            (policy_ctx.principal_type.as_ref()?, 0i32) // principal_data at offset 0
+        }
+        ExprKind::Var(Var::Resource) => {
+            (policy_ctx.resource_type.as_ref()?, 8i32) // resource_data at offset 8
+        }
+        _ => return None,
+    };
+
+    // Look up attribute in schema layout
+    let (slot_idx, slot_type, required) = schema_layout
+        .attr_indices
+        .get(&(entity_type.clone(), attr.clone()))?;
+
+    let entity_layout = schema_layout.entity_layouts.get(entity_type)?;
+
+    // Don't try direct access on open entity types (may have undeclared attrs)
+    if entity_layout.open {
+        return None;
+    }
+
+    // Load the entity data pointer from RuntimeCtx
+    let entity_data = builder.ins().load(
+        ptr_type,
+        MemFlags::trusted(),
+        ctx_val,
+        data_offset,
+    );
+
+    // Check if entity data pointer is null (entity not in compiled store)
+    let is_null = builder.ins().icmp_imm(IntCC::Equal, entity_data, 0);
+    let null_block = builder.create_block();
+    let valid_block = builder.create_block();
+    let merge_block = builder.create_block();
+
+    // Determine the merge block parameter type based on slot type
+    let result_type = match slot_type {
+        SlotType::Long => types::I64,
+        SlotType::Bool => types::I8,
+        _ => return None, // For complex types (Value), fall back to helper for now
+    };
+
+    builder.append_block_param(merge_block, result_type);
+    builder.ins().brif(is_null, null_block, &[], valid_block, &[]);
+
+    // Null path: return error (entity data not available)
+    builder.switch_to_block(null_block);
+    builder.seal_block(null_block);
+    // Fall through to error — but we can't easily return error AND a typed value.
+    // Instead, return a default and let the condition check handle it.
+    // Actually, null principal_data means the entity wasn't in the compiled store.
+    // This shouldn't happen in normal operation, but for safety return 0.
+    let default_val = builder.ins().iconst(result_type, 0);
+    builder.ins().jump(merge_block, &[default_val]);
+
+    // Valid path: load the attribute directly
+    builder.switch_to_block(valid_block);
+    builder.seal_block(valid_block);
+
+    let slot_offset = entity_layout.attrs[*slot_idx].offset;
+
+    if !required {
+        // Check presence bit
+        let bitmap = builder.ins().load(types::I64, MemFlags::trusted(), entity_data, 0);
+        let bit_mask = builder.ins().iconst(types::I64, 1i64 << slot_idx);
+        let bit_set = builder.ins().band(bitmap, bit_mask);
+        let is_present = builder.ins().icmp_imm(IntCC::NotEqual, bit_set, 0);
+        let present_block = builder.create_block();
+        let absent_block = builder.create_block();
+        builder.ins().brif(is_present, present_block, &[], absent_block, &[]);
+
+        // Absent: return default (this is an error in Cedar — HasAttr should be checked first)
+        builder.switch_to_block(absent_block);
+        builder.seal_block(absent_block);
+        let absent_val = builder.ins().iconst(result_type, 0);
+        builder.ins().jump(merge_block, &[absent_val]);
+
+        // Present: load value
+        builder.switch_to_block(present_block);
+        builder.seal_block(present_block);
+    }
+
+    let loaded = match slot_type {
+        SlotType::Long => {
+            builder.ins().load(types::I64, MemFlags::trusted(), entity_data, slot_offset as i32)
+        }
+        SlotType::Bool => {
+            let raw = builder.ins().load(types::I64, MemFlags::trusted(), entity_data, slot_offset as i32);
+            builder.ins().ireduce(types::I8, raw)
+        }
+        SlotType::Value => unreachable!(), // handled above with early return
+    };
+
+    builder.ins().jump(merge_block, &[loaded]);
+
+    builder.switch_to_block(merge_block);
+    builder.seal_block(merge_block);
+    let result = builder.block_params(merge_block)[0];
+
+    Some(match slot_type {
+        SlotType::Long => CompiledValue::Long(result),
+        SlotType::Bool => CompiledValue::Bool(result),
+        SlotType::Value => unreachable!(),
+    })
+}
+
+/// Try to compile `HasAttr(Var(Principal/Resource), attr)` as a compile-time constant
+/// when the schema says the attribute is required on the entity type.
+fn try_compile_flat_has_attr(
+    builder: &mut FunctionBuilder,
+    inner: &ast::Expr,
+    attr: &SmolStr,
+    ctx_val: cranelift_codegen::ir::Value,
+    ptr_type: Type,
+    policy_ctx: &PolicyTypeCtx,
+) -> Option<CompiledValue> {
+    let schema_layout = policy_ctx.schema_layout.as_ref()?;
+
+    let entity_type = match inner.expr_kind() {
+        ExprKind::Var(Var::Principal) => policy_ctx.principal_type.as_ref()?,
+        ExprKind::Var(Var::Resource) => policy_ctx.resource_type.as_ref()?,
+        _ => return None,
+    };
+
+    let entity_layout = schema_layout.entity_layouts.get(entity_type)?;
+    if entity_layout.open {
+        return None;
+    }
+
+    // Look up the attribute
+    if let Some((_slot_idx, _slot_type, required)) = schema_layout
+        .attr_indices
+        .get(&(entity_type.clone(), attr.clone()))
+    {
+        if *required {
+            // Required attribute — always present, constant fold to true
+            let one = builder.ins().iconst(types::I8, 1);
+            Some(CompiledValue::Bool(one))
+        } else {
+            // Optional attribute — need to check presence bitmap at runtime
+            let data_offset = match inner.expr_kind() {
+                ExprKind::Var(Var::Principal) => 0i32,
+                ExprKind::Var(Var::Resource) => 8i32,
+                _ => unreachable!(),
+            };
+            let entity_data = builder.ins().load(ptr_type, MemFlags::trusted(), ctx_val, data_offset);
+
+            // Null check
+            let is_null = builder.ins().icmp_imm(IntCC::Equal, entity_data, 0);
+            let null_block = builder.create_block();
+            let valid_block = builder.create_block();
+            let merge_block = builder.create_block();
+            builder.append_block_param(merge_block, types::I8);
+            builder.ins().brif(is_null, null_block, &[], valid_block, &[]);
+
+            builder.switch_to_block(null_block);
+            builder.seal_block(null_block);
+            let false_val = builder.ins().iconst(types::I8, 0);
+            builder.ins().jump(merge_block, &[false_val]);
+
+            builder.switch_to_block(valid_block);
+            builder.seal_block(valid_block);
+            let bitmap = builder.ins().load(types::I64, MemFlags::trusted(), entity_data, 0);
+            let bit_mask = builder.ins().iconst(types::I64, 1i64 << _slot_idx);
+            let bit_set = builder.ins().band(bitmap, bit_mask);
+            let is_present = builder.ins().icmp_imm(IntCC::NotEqual, bit_set, 0);
+            builder.ins().jump(merge_block, &[is_present]);
+
+            builder.switch_to_block(merge_block);
+            builder.seal_block(merge_block);
+            let result = builder.block_params(merge_block)[0];
+            Some(CompiledValue::Bool(result))
+        }
+    } else {
+        // Attribute not in schema — constant false
+        let zero = builder.ins().iconst(types::I8, 0);
+        Some(CompiledValue::Bool(zero))
     }
 }
 
 // I realize the And/Or/etc. cases above have bugs due to the block switching
 // mess. Let me rewrite them as separate functions that handle their own blocks cleanly.
+
+/// Inline check: is the TaggedValue a boolean true/false?
+/// Returns (is_bool_true, is_bool_false) — exactly one of these blocks is jumped to,
+/// plus error_block for errors. For TAG_VALUE, falls back to helpers.
+/// After this, builder is NOT positioned on any block — caller must switch_to_block.
+fn emit_bool_check(
+    builder: &mut FunctionBuilder,
+    h: &HelperSigs,
+    val: cranelift_codegen::ir::Value,
+    ptr_type: Type,
+    true_block: cranelift_codegen::ir::Block,
+    false_block: cranelift_codegen::ir::Block,
+    error_block: cranelift_codegen::ir::Block,
+) {
+    let tag = emit_load_tag(builder, val);
+
+    // TAG_ERROR → error
+    let not_err = builder.create_block();
+    let is_err = builder.ins().icmp_imm(IntCC::Equal, tag, TAG_ERROR);
+    builder.ins().brif(is_err, error_block, &[], not_err, &[]);
+
+    // TAG_BOOL → read payload directly
+    builder.switch_to_block(not_err);
+    builder.seal_block(not_err);
+    let fast_bool = builder.create_block();
+    let slow_path = builder.create_block();
+    let is_bool_tag = builder.ins().icmp_imm(IntCC::Equal, tag, TAG_BOOL);
+    builder.ins().brif(is_bool_tag, fast_bool, &[], slow_path, &[]);
+
+    builder.switch_to_block(fast_bool);
+    builder.seal_block(fast_bool);
+    let payload = emit_load_payload(builder, val);
+    let is_true = builder.ins().icmp_imm(IntCC::NotEqual, payload, 0);
+    builder.ins().brif(is_true, true_block, &[], false_block, &[]);
+
+    // Slow path: TAG_VALUE — call helpers
+    builder.switch_to_block(slow_path);
+    builder.seal_block(slow_path);
+    let is_bool_val = icall(builder, h.sig_ptr_to_u64, h.addr_is_bool, &[val], ptr_type);
+    let zero = builder.ins().iconst(types::I64, 0);
+    let not_bool = builder.ins().icmp(IntCC::Equal, is_bool_val, zero);
+    let get_val = builder.create_block();
+    builder.ins().brif(not_bool, error_block, &[], get_val, &[]);
+
+    builder.switch_to_block(get_val);
+    builder.seal_block(get_val);
+    let bool_result = icall(builder, h.sig_ptr_to_u64, h.addr_get_bool, &[val], ptr_type);
+    let slow_true = builder.ins().icmp(IntCC::NotEqual, bool_result, zero);
+    builder.ins().brif(slow_true, true_block, &[], false_block, &[]);
+}
+
+/// Inline error check: if tag == TAG_ERROR, jump to error_block.
+/// Otherwise fall through. Builder is positioned on the ok block after return.
+fn emit_error_check_inline(
+    builder: &mut FunctionBuilder,
+    val: cranelift_codegen::ir::Value,
+    error_block: cranelift_codegen::ir::Block,
+) {
+    let tag = emit_load_tag(builder, val);
+    let is_err = builder.ins().icmp_imm(IntCC::Equal, tag, TAG_ERROR);
+    let ok = builder.create_block();
+    builder.ins().brif(is_err, error_block, &[], ok, &[]);
+    builder.switch_to_block(ok);
+    builder.seal_block(ok);
+}
 
 fn compile_and(
     builder: &mut FunctionBuilder,
@@ -673,97 +1104,75 @@ fn compile_and(
     right: &ast::Expr,
     ctx_val: cranelift_codegen::ir::Value,
     ptr_type: Type,
-) -> cranelift_codegen::ir::Value {
-    let left_val = compile_expr(builder, ctx, h, left, ctx_val, ptr_type);
-    let zero_i64 = builder.ins().iconst(types::I64, 0);
+    policy_ctx: &PolicyTypeCtx,
+) -> CompiledValue {
+    let left_cv = compile_expr(builder, ctx, h, left, ctx_val, ptr_type, policy_ctx);
 
     let merge_block = builder.create_block();
     builder.append_block_param(merge_block, ptr_type);
-
-    // Check is_error(left)
-    let is_err = icall(builder, h.sig_ptr_to_u64, h.addr_is_error, &[left_val], ptr_type);
-    let err_cmp = builder.ins().icmp(IntCC::NotEqual, is_err, zero_i64);
     let error_block = builder.create_block();
-    let check_bool_block = builder.create_block();
-    builder.ins().brif(err_cmp, error_block, &[], check_bool_block, &[]);
-
-    // Error → return error
-    builder.switch_to_block(error_block);
-    builder.seal_block(error_block);
-    let ev = icall(builder, h.sig_void_to_ptr, h.addr_error, &[], ptr_type);
-    builder.ins().jump(merge_block, &[ev]);
-
-    // Check bool
-    builder.switch_to_block(check_bool_block);
-    builder.seal_block(check_bool_block);
-    let is_bool = icall(builder, h.sig_ptr_to_u64, h.addr_is_bool, &[left_val], ptr_type);
-    let zero2 = builder.ins().iconst(types::I64, 0);
-    let not_bool = builder.ins().icmp(IntCC::Equal, is_bool, zero2);
-    let check_true_block = builder.create_block();
-    let error2_block = builder.create_block();
-    builder.ins().brif(not_bool, error2_block, &[], check_true_block, &[]);
-
-    builder.switch_to_block(error2_block);
-    builder.seal_block(error2_block);
-    let ev2 = icall(builder, h.sig_void_to_ptr, h.addr_error, &[], ptr_type);
-    builder.ins().jump(merge_block, &[ev2]);
-
-    // Check if true
-    builder.switch_to_block(check_true_block);
-    builder.seal_block(check_true_block);
-    let bool_v = icall(builder, h.sig_ptr_to_u64, h.addr_get_bool, &[left_val], ptr_type);
-    let zero3 = builder.ins().iconst(types::I64, 0);
-    let is_true = builder.ins().icmp(IntCC::NotEqual, bool_v, zero3);
     let eval_right_block = builder.create_block();
     let false_block = builder.create_block();
-    builder.ins().brif(is_true, eval_right_block, &[], false_block, &[]);
 
-    // False → return false
+    // Dispatch on CompiledValue: Bool skips tag check entirely
+    match left_cv {
+        CompiledValue::Bool(v) => {
+            builder.ins().brif(v, eval_right_block, &[], false_block, &[]);
+        }
+        CompiledValue::Error => {
+            builder.ins().jump(error_block, &[]);
+        }
+        CompiledValue::Long(_) => {
+            builder.ins().jump(error_block, &[]);
+        }
+        CompiledValue::Tagged(ptr) => {
+            emit_bool_check(builder, h, ptr, ptr_type, eval_right_block, false_block, error_block);
+        }
+    }
+
+    // Error → alloc error and merge
+    builder.switch_to_block(error_block);
+    builder.seal_block(error_block);
+    let err_payload = builder.ins().iconst(types::I64, 0);
+    let ev = emit_tagged(builder, TAG_ERROR, err_payload, ptr_type);
+    builder.ins().jump(merge_block, &[ev]);
+
+    // False → return false (inline)
     builder.switch_to_block(false_block);
     builder.seal_block(false_block);
-    let fv = builder.ins().iconst(types::I64, 0);
-    let false_tv = icall(builder, h.sig_u64_to_ptr, h.addr_lit_bool, &[fv], ptr_type);
-    builder.ins().jump(merge_block, &[false_tv]);
+    let false_payload = builder.ins().iconst(types::I64, 0);
+    let fv = emit_tagged(builder, TAG_BOOL, false_payload, ptr_type);
+    builder.ins().jump(merge_block, &[fv]);
 
     // Eval right
     builder.switch_to_block(eval_right_block);
     builder.seal_block(eval_right_block);
-    let right_val = compile_expr(builder, ctx, h, right, ctx_val, ptr_type);
+    let right_cv = compile_expr(builder, ctx, h, right, ctx_val, ptr_type, policy_ctx);
+    let right_val = right_cv.to_tagged(builder, ptr_type);
 
-    // Check right for error/non-bool
-    let r_is_err = icall(builder, h.sig_ptr_to_u64, h.addr_is_error, &[right_val], ptr_type);
-    let zero4 = builder.ins().iconst(types::I64, 0);
-    let r_err_cmp = builder.ins().icmp(IntCC::NotEqual, r_is_err, zero4);
-    let r_err_block = builder.create_block();
-    let r_check_bool = builder.create_block();
-    builder.ins().brif(r_err_cmp, r_err_block, &[], r_check_bool, &[]);
+    // Check right: must be bool, else error
+    let r_true = builder.create_block();
+    let r_false = builder.create_block();
+    let r_error = builder.create_block();
+    emit_bool_check(builder, h, right_val, ptr_type, r_true, r_false, r_error);
 
-    builder.switch_to_block(r_err_block);
-    builder.seal_block(r_err_block);
-    let ev3 = icall(builder, h.sig_void_to_ptr, h.addr_error, &[], ptr_type);
-    builder.ins().jump(merge_block, &[ev3]);
+    builder.switch_to_block(r_error);
+    builder.seal_block(r_error);
+    let re_payload = builder.ins().iconst(types::I64, 0);
+    let rev = emit_tagged(builder, TAG_ERROR, re_payload, ptr_type);
+    builder.ins().jump(merge_block, &[rev]);
 
-    builder.switch_to_block(r_check_bool);
-    builder.seal_block(r_check_bool);
-    let r_is_bool = icall(builder, h.sig_ptr_to_u64, h.addr_is_bool, &[right_val], ptr_type);
-    let zero5 = builder.ins().iconst(types::I64, 0);
-    let r_not_bool = builder.ins().icmp(IntCC::Equal, r_is_bool, zero5);
-    let r_ok = builder.create_block();
-    let r_err2 = builder.create_block();
-    builder.ins().brif(r_not_bool, r_err2, &[], r_ok, &[]);
+    builder.switch_to_block(r_true);
+    builder.seal_block(r_true);
+    builder.ins().jump(merge_block, &[right_val]);
 
-    builder.switch_to_block(r_err2);
-    builder.seal_block(r_err2);
-    let ev4 = icall(builder, h.sig_void_to_ptr, h.addr_error, &[], ptr_type);
-    builder.ins().jump(merge_block, &[ev4]);
-
-    builder.switch_to_block(r_ok);
-    builder.seal_block(r_ok);
+    builder.switch_to_block(r_false);
+    builder.seal_block(r_false);
     builder.ins().jump(merge_block, &[right_val]);
 
     builder.switch_to_block(merge_block);
     builder.seal_block(merge_block);
-    builder.block_params(merge_block)[0]
+    CompiledValue::Tagged(builder.block_params(merge_block)[0])
 }
 
 fn compile_or(
@@ -774,92 +1183,72 @@ fn compile_or(
     right: &ast::Expr,
     ctx_val: cranelift_codegen::ir::Value,
     ptr_type: Type,
-) -> cranelift_codegen::ir::Value {
-    let left_val = compile_expr(builder, ctx, h, left, ctx_val, ptr_type);
-    let zero_i64 = builder.ins().iconst(types::I64, 0);
+    policy_ctx: &PolicyTypeCtx,
+) -> CompiledValue {
+    let left_cv = compile_expr(builder, ctx, h, left, ctx_val, ptr_type, policy_ctx);
 
     let merge_block = builder.create_block();
     builder.append_block_param(merge_block, ptr_type);
-
-    let is_err = icall(builder, h.sig_ptr_to_u64, h.addr_is_error, &[left_val], ptr_type);
-    let err_cmp = builder.ins().icmp(IntCC::NotEqual, is_err, zero_i64);
     let error_block = builder.create_block();
-    let check_bool_block = builder.create_block();
-    builder.ins().brif(err_cmp, error_block, &[], check_bool_block, &[]);
+    let true_block = builder.create_block();
+    let eval_right_block = builder.create_block();
+
+    match left_cv {
+        CompiledValue::Bool(v) => {
+            builder.ins().brif(v, true_block, &[], eval_right_block, &[]);
+        }
+        CompiledValue::Error => {
+            builder.ins().jump(error_block, &[]);
+        }
+        CompiledValue::Long(_) => {
+            builder.ins().jump(error_block, &[]);
+        }
+        CompiledValue::Tagged(ptr) => {
+            emit_bool_check(builder, h, ptr, ptr_type, true_block, eval_right_block, error_block);
+        }
+    }
 
     builder.switch_to_block(error_block);
     builder.seal_block(error_block);
-    let ev = icall(builder, h.sig_void_to_ptr, h.addr_error, &[], ptr_type);
+    let err_p = builder.ins().iconst(types::I64, 0);
+    let ev = emit_tagged(builder, TAG_ERROR, err_p, ptr_type);
     builder.ins().jump(merge_block, &[ev]);
 
-    builder.switch_to_block(check_bool_block);
-    builder.seal_block(check_bool_block);
-    let is_bool = icall(builder, h.sig_ptr_to_u64, h.addr_is_bool, &[left_val], ptr_type);
-    let zero2 = builder.ins().iconst(types::I64, 0);
-    let not_bool = builder.ins().icmp(IntCC::Equal, is_bool, zero2);
-    let check_false_block = builder.create_block();
-    let error2_block = builder.create_block();
-    builder.ins().brif(not_bool, error2_block, &[], check_false_block, &[]);
-
-    builder.switch_to_block(error2_block);
-    builder.seal_block(error2_block);
-    let ev2 = icall(builder, h.sig_void_to_ptr, h.addr_error, &[], ptr_type);
-    builder.ins().jump(merge_block, &[ev2]);
-
-    builder.switch_to_block(check_false_block);
-    builder.seal_block(check_false_block);
-    let bool_v = icall(builder, h.sig_ptr_to_u64, h.addr_get_bool, &[left_val], ptr_type);
-    let zero3 = builder.ins().iconst(types::I64, 0);
-    let is_false = builder.ins().icmp(IntCC::Equal, bool_v, zero3);
-    let eval_right_block = builder.create_block();
-    let true_block = builder.create_block();
-    builder.ins().brif(is_false, eval_right_block, &[], true_block, &[]);
-
-    // True → return true
+    // True → return true (inline)
     builder.switch_to_block(true_block);
     builder.seal_block(true_block);
-    let tv = builder.ins().iconst(types::I64, 1);
-    let true_tv = icall(builder, h.sig_u64_to_ptr, h.addr_lit_bool, &[tv], ptr_type);
-    builder.ins().jump(merge_block, &[true_tv]);
+    let true_p = builder.ins().iconst(types::I64, 1);
+    let tv = emit_tagged(builder, TAG_BOOL, true_p, ptr_type);
+    builder.ins().jump(merge_block, &[tv]);
 
     // Eval right
     builder.switch_to_block(eval_right_block);
     builder.seal_block(eval_right_block);
-    let right_val = compile_expr(builder, ctx, h, right, ctx_val, ptr_type);
+    let right_cv = compile_expr(builder, ctx, h, right, ctx_val, ptr_type, policy_ctx);
+    let right_val = right_cv.to_tagged(builder, ptr_type);
 
-    let r_is_err = icall(builder, h.sig_ptr_to_u64, h.addr_is_error, &[right_val], ptr_type);
-    let zero4 = builder.ins().iconst(types::I64, 0);
-    let r_err_cmp = builder.ins().icmp(IntCC::NotEqual, r_is_err, zero4);
-    let r_err_block = builder.create_block();
-    let r_check_bool = builder.create_block();
-    builder.ins().brif(r_err_cmp, r_err_block, &[], r_check_bool, &[]);
+    let r_true = builder.create_block();
+    let r_false = builder.create_block();
+    let r_error = builder.create_block();
+    emit_bool_check(builder, h, right_val, ptr_type, r_true, r_false, r_error);
 
-    builder.switch_to_block(r_err_block);
-    builder.seal_block(r_err_block);
-    let ev3 = icall(builder, h.sig_void_to_ptr, h.addr_error, &[], ptr_type);
-    builder.ins().jump(merge_block, &[ev3]);
+    builder.switch_to_block(r_error);
+    builder.seal_block(r_error);
+    let re_p = builder.ins().iconst(types::I64, 0);
+    let rev = emit_tagged(builder, TAG_ERROR, re_p, ptr_type);
+    builder.ins().jump(merge_block, &[rev]);
 
-    builder.switch_to_block(r_check_bool);
-    builder.seal_block(r_check_bool);
-    let r_is_bool = icall(builder, h.sig_ptr_to_u64, h.addr_is_bool, &[right_val], ptr_type);
-    let zero5 = builder.ins().iconst(types::I64, 0);
-    let r_not_bool = builder.ins().icmp(IntCC::Equal, r_is_bool, zero5);
-    let r_ok = builder.create_block();
-    let r_err2 = builder.create_block();
-    builder.ins().brif(r_not_bool, r_err2, &[], r_ok, &[]);
+    builder.switch_to_block(r_true);
+    builder.seal_block(r_true);
+    builder.ins().jump(merge_block, &[right_val]);
 
-    builder.switch_to_block(r_err2);
-    builder.seal_block(r_err2);
-    let ev4 = icall(builder, h.sig_void_to_ptr, h.addr_error, &[], ptr_type);
-    builder.ins().jump(merge_block, &[ev4]);
-
-    builder.switch_to_block(r_ok);
-    builder.seal_block(r_ok);
+    builder.switch_to_block(r_false);
+    builder.seal_block(r_false);
     builder.ins().jump(merge_block, &[right_val]);
 
     builder.switch_to_block(merge_block);
     builder.seal_block(merge_block);
-    builder.block_params(merge_block)[0]
+    CompiledValue::Tagged(builder.block_params(merge_block)[0])
 }
 
 fn compile_if(
@@ -871,60 +1260,50 @@ fn compile_if(
     else_e: &ast::Expr,
     ctx_val: cranelift_codegen::ir::Value,
     ptr_type: Type,
-) -> cranelift_codegen::ir::Value {
-    let test_val = compile_expr(builder, ctx, h, test, ctx_val, ptr_type);
-    let zero_i64 = builder.ins().iconst(types::I64, 0);
+    policy_ctx: &PolicyTypeCtx,
+) -> CompiledValue {
+    let test_cv = compile_expr(builder, ctx, h, test, ctx_val, ptr_type, policy_ctx);
 
     let merge_block = builder.create_block();
     builder.append_block_param(merge_block, ptr_type);
-
-    let is_err = icall(builder, h.sig_ptr_to_u64, h.addr_is_error, &[test_val], ptr_type);
-    let err_cmp = builder.ins().icmp(IntCC::NotEqual, is_err, zero_i64);
+    let then_block = builder.create_block();
+    let else_block = builder.create_block();
     let error_block = builder.create_block();
-    let check_bool = builder.create_block();
-    builder.ins().brif(err_cmp, error_block, &[], check_bool, &[]);
+
+    match test_cv {
+        CompiledValue::Bool(v) => {
+            builder.ins().brif(v, then_block, &[], else_block, &[]);
+        }
+        CompiledValue::Error => {
+            builder.ins().jump(error_block, &[]);
+        }
+        CompiledValue::Long(_) => {
+            builder.ins().jump(error_block, &[]);
+        }
+        CompiledValue::Tagged(ptr) => {
+            emit_bool_check(builder, h, ptr, ptr_type, then_block, else_block, error_block);
+        }
+    }
 
     builder.switch_to_block(error_block);
     builder.seal_block(error_block);
-    let ev = icall(builder, h.sig_void_to_ptr, h.addr_error, &[], ptr_type);
+    let err_p = builder.ins().iconst(types::I64, 0);
+    let ev = emit_tagged(builder, TAG_ERROR, err_p, ptr_type);
     builder.ins().jump(merge_block, &[ev]);
-
-    builder.switch_to_block(check_bool);
-    builder.seal_block(check_bool);
-    let is_bool = icall(builder, h.sig_ptr_to_u64, h.addr_is_bool, &[test_val], ptr_type);
-    let zero2 = builder.ins().iconst(types::I64, 0);
-    let not_bool = builder.ins().icmp(IntCC::Equal, is_bool, zero2);
-    let check_true = builder.create_block();
-    let error2 = builder.create_block();
-    builder.ins().brif(not_bool, error2, &[], check_true, &[]);
-
-    builder.switch_to_block(error2);
-    builder.seal_block(error2);
-    let ev2 = icall(builder, h.sig_void_to_ptr, h.addr_error, &[], ptr_type);
-    builder.ins().jump(merge_block, &[ev2]);
-
-    builder.switch_to_block(check_true);
-    builder.seal_block(check_true);
-    let bool_v = icall(builder, h.sig_ptr_to_u64, h.addr_get_bool, &[test_val], ptr_type);
-    let zero3 = builder.ins().iconst(types::I64, 0);
-    let is_true = builder.ins().icmp(IntCC::NotEqual, bool_v, zero3);
-    let then_block = builder.create_block();
-    let else_block = builder.create_block();
-    builder.ins().brif(is_true, then_block, &[], else_block, &[]);
 
     builder.switch_to_block(then_block);
     builder.seal_block(then_block);
-    let then_val = compile_expr(builder, ctx, h, then_e, ctx_val, ptr_type);
+    let then_val = compile_expr(builder, ctx, h, then_e, ctx_val, ptr_type, policy_ctx).to_tagged(builder, ptr_type);
     builder.ins().jump(merge_block, &[then_val]);
 
     builder.switch_to_block(else_block);
     builder.seal_block(else_block);
-    let else_val = compile_expr(builder, ctx, h, else_e, ctx_val, ptr_type);
+    let else_val = compile_expr(builder, ctx, h, else_e, ctx_val, ptr_type, policy_ctx).to_tagged(builder, ptr_type);
     builder.ins().jump(merge_block, &[else_val]);
 
     builder.switch_to_block(merge_block);
     builder.seal_block(merge_block);
-    builder.block_params(merge_block)[0]
+    CompiledValue::Tagged(builder.block_params(merge_block)[0])
 }
 
 fn compile_unary(
@@ -935,37 +1314,150 @@ fn compile_unary(
     arg: &ast::Expr,
     ctx_val: cranelift_codegen::ir::Value,
     ptr_type: Type,
-) -> cranelift_codegen::ir::Value {
-    let arg_val = compile_expr(builder, ctx, h, arg, ctx_val, ptr_type);
+    policy_ctx: &PolicyTypeCtx,
+) -> CompiledValue {
+    let arg_cv = compile_expr(builder, ctx, h, arg, ctx_val, ptr_type, policy_ctx);
+
+    // Fast path: Not(Bool) → Bool(1-v), Neg(Long) handled below
+    match op {
+        UnaryOp::Not => {
+            if let CompiledValue::Bool(v) = arg_cv {
+                let one = builder.ins().iconst(types::I8, 1);
+                let flipped = builder.ins().isub(one, v);
+                return CompiledValue::Bool(flipped);
+            }
+            if let CompiledValue::Error = arg_cv {
+                return CompiledValue::Error;
+            }
+        }
+        UnaryOp::Neg => {
+            if let CompiledValue::Error = arg_cv {
+                return CompiledValue::Error;
+            }
+        }
+        _ => {}
+    }
+
+    let arg_val = arg_cv.to_tagged(builder, ptr_type);
 
     let merge_block = builder.create_block();
     builder.append_block_param(merge_block, ptr_type);
     let error_block = builder.create_block();
 
-    let is_err = icall(builder, h.sig_ptr_to_u64, h.addr_is_error, &[arg_val], ptr_type);
-    let zero = builder.ins().iconst(types::I64, 0);
-    let cmp = builder.ins().icmp(IntCC::NotEqual, is_err, zero);
-    let ok_block = builder.create_block();
-    builder.ins().brif(cmp, error_block, &[], ok_block, &[]);
+    // Inline error check
+    emit_error_check_inline(builder, arg_val, error_block);
+
+    let tag = emit_load_tag(builder, arg_val);
+
+    match op {
+        UnaryOp::Not => {
+            // Fast path: TAG_BOOL → flip payload inline
+            let fast_block = builder.create_block();
+            let slow_block = builder.create_block();
+            let is_bool = builder.ins().icmp_imm(IntCC::Equal, tag, TAG_BOOL);
+            builder.ins().brif(is_bool, fast_block, &[], slow_block, &[]);
+
+            builder.switch_to_block(fast_block);
+            builder.seal_block(fast_block);
+            let payload = emit_load_payload(builder, arg_val);
+            let one = builder.ins().iconst(types::I64, 1);
+            let flipped = builder.ins().isub(one, payload);
+            let result = emit_tagged(builder, TAG_BOOL, flipped, ptr_type);
+            builder.ins().jump(merge_block, &[result]);
+
+            // Slow path: TAG_VALUE → call helper
+            builder.switch_to_block(slow_block);
+            builder.seal_block(slow_block);
+            let slow_result = icall(builder, h.sig_ptr_to_ptr, h.addr_not, &[arg_val], ptr_type);
+            builder.ins().jump(merge_block, &[slow_result]);
+        }
+        UnaryOp::Neg => {
+            // Fast path: TAG_LONG → negate payload inline with overflow check
+            let fast_block = builder.create_block();
+            let slow_block = builder.create_block();
+            let is_long = builder.ins().icmp_imm(IntCC::Equal, tag, TAG_LONG);
+            builder.ins().brif(is_long, fast_block, &[], slow_block, &[]);
+
+            builder.switch_to_block(fast_block);
+            builder.seal_block(fast_block);
+            let payload = emit_load_payload(builder, arg_val);
+            // i64::MIN cannot be negated — check for overflow
+            let min_val = builder.ins().iconst(types::I64, i64::MIN);
+            let is_min = builder.ins().icmp(IntCC::Equal, payload, min_val);
+            let neg_ok = builder.create_block();
+            builder.ins().brif(is_min, error_block, &[], neg_ok, &[]);
+
+            builder.switch_to_block(neg_ok);
+            builder.seal_block(neg_ok);
+            let negated = builder.ins().ineg(payload);
+            let result = emit_tagged(builder, TAG_LONG, negated, ptr_type);
+            builder.ins().jump(merge_block, &[result]);
+
+            // Slow path
+            builder.switch_to_block(slow_block);
+            builder.seal_block(slow_block);
+            let slow_result = icall(builder, h.sig_ptr_to_ptr, h.addr_neg, &[arg_val], ptr_type);
+            builder.ins().jump(merge_block, &[slow_result]);
+        }
+        UnaryOp::IsEmpty => {
+            // No fast path — always call helper
+            let result = icall(builder, h.sig_ptr_to_ptr, h.addr_is_empty_set, &[arg_val], ptr_type);
+            builder.ins().jump(merge_block, &[result]);
+        }
+    }
 
     builder.switch_to_block(error_block);
     builder.seal_block(error_block);
-    let ev = icall(builder, h.sig_void_to_ptr, h.addr_error, &[], ptr_type);
+    let err_p = builder.ins().iconst(types::I64, 0);
+    let ev = emit_tagged(builder, TAG_ERROR, err_p, ptr_type);
     builder.ins().jump(merge_block, &[ev]);
-
-    builder.switch_to_block(ok_block);
-    builder.seal_block(ok_block);
-    let (sig, addr) = match op {
-        UnaryOp::Not => (h.sig_ptr_to_ptr, h.addr_not),
-        UnaryOp::Neg => (h.sig_ptr_to_ptr, h.addr_neg),
-        UnaryOp::IsEmpty => (h.sig_ptr_to_ptr, h.addr_is_empty_set),
-    };
-    let result = icall(builder, sig, addr, &[arg_val], ptr_type);
-    builder.ins().jump(merge_block, &[result]);
 
     builder.switch_to_block(merge_block);
     builder.seal_block(merge_block);
-    builder.block_params(merge_block)[0]
+    CompiledValue::Tagged(builder.block_params(merge_block)[0])
+}
+
+/// Emit inline integer binary op: both args must be TAG_LONG.
+/// Fast path does the op natively; slow path calls the helper.
+fn emit_long_binop(
+    builder: &mut FunctionBuilder,
+    _h: &HelperSigs,
+    a1: cranelift_codegen::ir::Value,
+    a2: cranelift_codegen::ir::Value,
+    ptr_type: Type,
+    merge_block: cranelift_codegen::ir::Block,
+    error_block: cranelift_codegen::ir::Block,
+    helper_sig: SigRef,
+    helper_addr: u64,
+    emit_fast: impl FnOnce(&mut FunctionBuilder, cranelift_codegen::ir::Value, cranelift_codegen::ir::Value, cranelift_codegen::ir::Block, Type),
+) {
+    let tag_a = emit_load_tag(builder, a1);
+    let tag_b = emit_load_tag(builder, a2);
+    let both_long = builder.create_block();
+    let slow = builder.create_block();
+
+    let a_is_long = builder.ins().icmp_imm(IntCC::Equal, tag_a, TAG_LONG);
+    let check_b = builder.create_block();
+    builder.ins().brif(a_is_long, check_b, &[], slow, &[]);
+
+    builder.switch_to_block(check_b);
+    builder.seal_block(check_b);
+    let b_is_long = builder.ins().icmp_imm(IntCC::Equal, tag_b, TAG_LONG);
+    builder.ins().brif(b_is_long, both_long, &[], slow, &[]);
+
+    // Fast path: both TAG_LONG
+    builder.switch_to_block(both_long);
+    builder.seal_block(both_long);
+    let pa = emit_load_payload(builder, a1);
+    let pb = emit_load_payload(builder, a2);
+    emit_fast(builder, pa, pb, error_block, ptr_type);
+    // emit_fast must jump to merge_block or error_block
+
+    // Slow path: call helper
+    builder.switch_to_block(slow);
+    builder.seal_block(slow);
+    let result = icall(builder, helper_sig, helper_addr, &[a1, a2], ptr_type);
+    builder.ins().jump(merge_block, &[result]);
 }
 
 fn compile_binary(
@@ -977,64 +1469,184 @@ fn compile_binary(
     arg2: &ast::Expr,
     ctx_val: cranelift_codegen::ir::Value,
     ptr_type: Type,
-) -> cranelift_codegen::ir::Value {
-    let a1 = compile_expr(builder, ctx, h, arg1, ctx_val, ptr_type);
+    policy_ctx: &PolicyTypeCtx,
+) -> CompiledValue {
+    let a1_cv = compile_expr(builder, ctx, h, arg1, ctx_val, ptr_type, policy_ctx);
+
+    // Fast paths for known types
+    let a2_cv = compile_expr(builder, ctx, h, arg2, ctx_val, ptr_type, policy_ctx);
+
+    // Check for static errors
+    if let CompiledValue::Error = a1_cv { return CompiledValue::Error; }
+    if let CompiledValue::Error = a2_cv { return CompiledValue::Error; }
+
+    // Fast path: Less/LessEq/Eq when both types are known
+    match op {
+        BinaryOp::Less => {
+            if let (CompiledValue::Long(a), CompiledValue::Long(b)) = (a1_cv, a2_cv) {
+                let cmp = builder.ins().icmp(IntCC::SignedLessThan, a, b);
+                return CompiledValue::Bool(cmp);
+            }
+        }
+        BinaryOp::LessEq => {
+            if let (CompiledValue::Long(a), CompiledValue::Long(b)) = (a1_cv, a2_cv) {
+                let cmp = builder.ins().icmp(IntCC::SignedLessThanOrEqual, a, b);
+                return CompiledValue::Bool(cmp);
+            }
+        }
+        BinaryOp::Eq => {
+            match (a1_cv, a2_cv) {
+                (CompiledValue::Bool(a), CompiledValue::Bool(b)) => {
+                    let cmp = builder.ins().icmp(IntCC::Equal, a, b);
+                    return CompiledValue::Bool(cmp);
+                }
+                (CompiledValue::Long(a), CompiledValue::Long(b)) => {
+                    let cmp = builder.ins().icmp(IntCC::Equal, a, b);
+                    return CompiledValue::Bool(cmp);
+                }
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+
+    // Box to tagged for the general path
+    let a1 = a1_cv.to_tagged(builder, ptr_type);
+    let a2 = a2_cv.to_tagged(builder, ptr_type);
 
     let merge_block = builder.create_block();
     builder.append_block_param(merge_block, ptr_type);
     let error_block = builder.create_block();
 
-    // Check a1 error
-    let is_err = icall(builder, h.sig_ptr_to_u64, h.addr_is_error, &[a1], ptr_type);
-    let zero = builder.ins().iconst(types::I64, 0);
-    let cmp = builder.ins().icmp(IntCC::NotEqual, is_err, zero);
-    let a1_ok = builder.create_block();
-    builder.ins().brif(cmp, error_block, &[], a1_ok, &[]);
+    // Inline error checks
+    emit_error_check_inline(builder, a1, error_block);
+    emit_error_check_inline(builder, a2, error_block);
+
+    match op {
+        BinaryOp::Add => {
+            emit_long_binop(builder, h, a1, a2, ptr_type, merge_block, error_block,
+                h.sig_2ptr_to_ptr, h.addr_add, |b, pa, pb, err_blk, pt| {
+                    // Native add with overflow check
+                    let (result, overflow) = b.ins().sadd_overflow(pa, pb);
+                    let ok = b.create_block();
+                    b.ins().brif(overflow, err_blk, &[], ok, &[]);
+                    b.switch_to_block(ok);
+                    b.seal_block(ok);
+                    let tv = emit_tagged(b, TAG_LONG, result, pt);
+                    b.ins().jump(merge_block, &[tv]);
+                });
+        }
+        BinaryOp::Sub => {
+            emit_long_binop(builder, h, a1, a2, ptr_type, merge_block, error_block,
+                h.sig_2ptr_to_ptr, h.addr_sub, |b, pa, pb, err_blk, pt| {
+                    let (result, overflow) = b.ins().ssub_overflow(pa, pb);
+                    let ok = b.create_block();
+                    b.ins().brif(overflow, err_blk, &[], ok, &[]);
+                    b.switch_to_block(ok);
+                    b.seal_block(ok);
+                    let tv = emit_tagged(b, TAG_LONG, result, pt);
+                    b.ins().jump(merge_block, &[tv]);
+                });
+        }
+        BinaryOp::Mul => {
+            emit_long_binop(builder, h, a1, a2, ptr_type, merge_block, error_block,
+                h.sig_2ptr_to_ptr, h.addr_mul, |b, pa, pb, err_blk, pt| {
+                    let (result, overflow) = b.ins().smul_overflow(pa, pb);
+                    let ok = b.create_block();
+                    b.ins().brif(overflow, err_blk, &[], ok, &[]);
+                    b.switch_to_block(ok);
+                    b.seal_block(ok);
+                    let tv = emit_tagged(b, TAG_LONG, result, pt);
+                    b.ins().jump(merge_block, &[tv]);
+                });
+        }
+        BinaryOp::Less => {
+            emit_long_binop(builder, h, a1, a2, ptr_type, merge_block, error_block,
+                h.sig_2ptr_to_ptr, h.addr_less, |b, pa, pb, _err_blk, pt| {
+                    let cmp = b.ins().icmp(IntCC::SignedLessThan, pa, pb);
+                    let result_i64 = b.ins().uextend(types::I64, cmp);
+                    let tv = emit_tagged(b, TAG_BOOL, result_i64, pt);
+                    b.ins().jump(merge_block, &[tv]);
+                });
+        }
+        BinaryOp::LessEq => {
+            emit_long_binop(builder, h, a1, a2, ptr_type, merge_block, error_block,
+                h.sig_2ptr_to_ptr, h.addr_less_eq, |b, pa, pb, _err_blk, pt| {
+                    let cmp = b.ins().icmp(IntCC::SignedLessThanOrEqual, pa, pb);
+                    let result_i64 = b.ins().uextend(types::I64, cmp);
+                    let tv = emit_tagged(b, TAG_BOOL, result_i64, pt);
+                    b.ins().jump(merge_block, &[tv]);
+                });
+        }
+        BinaryOp::Eq => {
+            // Fast path: same tag + same payload for primitives
+            let tag_a = emit_load_tag(builder, a1);
+            let tag_b = emit_load_tag(builder, a2);
+            let tags_match = builder.ins().icmp(IntCC::Equal, tag_a, tag_b);
+            let same_tag = builder.create_block();
+            let slow = builder.create_block();
+            builder.ins().brif(tags_match, same_tag, &[], slow, &[]);
+
+            builder.switch_to_block(same_tag);
+            builder.seal_block(same_tag);
+            // Only fast-path for TAG_BOOL and TAG_LONG
+            let is_bool = builder.ins().icmp_imm(IntCC::Equal, tag_a, TAG_BOOL);
+            let is_long = builder.ins().icmp_imm(IntCC::Equal, tag_a, TAG_LONG);
+            let is_primitive = builder.ins().bor(is_bool, is_long);
+            let fast = builder.create_block();
+            builder.ins().brif(is_primitive, fast, &[], slow, &[]);
+
+            builder.switch_to_block(fast);
+            builder.seal_block(fast);
+            let pa = emit_load_payload(builder, a1);
+            let pb = emit_load_payload(builder, a2);
+            let eq = builder.ins().icmp(IntCC::Equal, pa, pb);
+            let eq_i64 = builder.ins().uextend(types::I64, eq);
+            let tv = emit_tagged(builder, TAG_BOOL, eq_i64, ptr_type);
+            builder.ins().jump(merge_block, &[tv]);
+
+            // Slow path: call helper (handles Value types, cross-type eq)
+            builder.switch_to_block(slow);
+            builder.seal_block(slow);
+            let result = icall(builder, h.sig_2ptr_to_ptr, h.addr_eq, &[a1, a2], ptr_type);
+            builder.ins().jump(merge_block, &[result]);
+        }
+        // These always need helpers — complex data structure operations
+        BinaryOp::In => {
+            let result = icall(builder, h.sig_3ptr_to_ptr, h.addr_in_op, &[a1, a2, ctx_val], ptr_type);
+            builder.ins().jump(merge_block, &[result]);
+        }
+        BinaryOp::Contains => {
+            let result = icall(builder, h.sig_2ptr_to_ptr, h.addr_contains, &[a1, a2], ptr_type);
+            builder.ins().jump(merge_block, &[result]);
+        }
+        BinaryOp::ContainsAll => {
+            let result = icall(builder, h.sig_2ptr_to_ptr, h.addr_contains_all, &[a1, a2], ptr_type);
+            builder.ins().jump(merge_block, &[result]);
+        }
+        BinaryOp::ContainsAny => {
+            let result = icall(builder, h.sig_2ptr_to_ptr, h.addr_contains_any, &[a1, a2], ptr_type);
+            builder.ins().jump(merge_block, &[result]);
+        }
+        BinaryOp::GetTag => {
+            let result = icall(builder, h.sig_3ptr_to_ptr, h.addr_get_tag, &[a1, a2, ctx_val], ptr_type);
+            builder.ins().jump(merge_block, &[result]);
+        }
+        BinaryOp::HasTag => {
+            let result = icall(builder, h.sig_3ptr_to_ptr, h.addr_has_tag, &[a1, a2, ctx_val], ptr_type);
+            builder.ins().jump(merge_block, &[result]);
+        }
+    }
 
     builder.switch_to_block(error_block);
     builder.seal_block(error_block);
-    let ev = icall(builder, h.sig_void_to_ptr, h.addr_error, &[], ptr_type);
+    let err_p = builder.ins().iconst(types::I64, 0);
+    let ev = emit_tagged(builder, TAG_ERROR, err_p, ptr_type);
     builder.ins().jump(merge_block, &[ev]);
-
-    builder.switch_to_block(a1_ok);
-    builder.seal_block(a1_ok);
-    let a2 = compile_expr(builder, ctx, h, arg2, ctx_val, ptr_type);
-
-    // Check a2 error
-    let is_err2 = icall(builder, h.sig_ptr_to_u64, h.addr_is_error, &[a2], ptr_type);
-    let zero2 = builder.ins().iconst(types::I64, 0);
-    let cmp2 = builder.ins().icmp(IntCC::NotEqual, is_err2, zero2);
-    let a2_ok = builder.create_block();
-    let err2_block = builder.create_block();
-    builder.ins().brif(cmp2, err2_block, &[], a2_ok, &[]);
-
-    builder.switch_to_block(err2_block);
-    builder.seal_block(err2_block);
-    let ev2 = icall(builder, h.sig_void_to_ptr, h.addr_error, &[], ptr_type);
-    builder.ins().jump(merge_block, &[ev2]);
-
-    builder.switch_to_block(a2_ok);
-    builder.seal_block(a2_ok);
-
-    let result = match op {
-        BinaryOp::Eq => icall(builder, h.sig_2ptr_to_ptr, h.addr_eq, &[a1, a2], ptr_type),
-        BinaryOp::Less => icall(builder, h.sig_2ptr_to_ptr, h.addr_less, &[a1, a2], ptr_type),
-        BinaryOp::LessEq => icall(builder, h.sig_2ptr_to_ptr, h.addr_less_eq, &[a1, a2], ptr_type),
-        BinaryOp::Add => icall(builder, h.sig_2ptr_to_ptr, h.addr_add, &[a1, a2], ptr_type),
-        BinaryOp::Sub => icall(builder, h.sig_2ptr_to_ptr, h.addr_sub, &[a1, a2], ptr_type),
-        BinaryOp::Mul => icall(builder, h.sig_2ptr_to_ptr, h.addr_mul, &[a1, a2], ptr_type),
-        BinaryOp::In => icall(builder, h.sig_3ptr_to_ptr, h.addr_in_op, &[a1, a2, ctx_val], ptr_type),
-        BinaryOp::Contains => icall(builder, h.sig_2ptr_to_ptr, h.addr_contains, &[a1, a2], ptr_type),
-        BinaryOp::ContainsAll => icall(builder, h.sig_2ptr_to_ptr, h.addr_contains_all, &[a1, a2], ptr_type),
-        BinaryOp::ContainsAny => icall(builder, h.sig_2ptr_to_ptr, h.addr_contains_any, &[a1, a2], ptr_type),
-        BinaryOp::GetTag => icall(builder, h.sig_3ptr_to_ptr, h.addr_get_tag, &[a1, a2, ctx_val], ptr_type),
-        BinaryOp::HasTag => icall(builder, h.sig_3ptr_to_ptr, h.addr_has_tag, &[a1, a2, ctx_val], ptr_type),
-    };
-    builder.ins().jump(merge_block, &[result]);
 
     builder.switch_to_block(merge_block);
     builder.seal_block(merge_block);
-    builder.block_params(merge_block)[0]
+    CompiledValue::Tagged(builder.block_params(merge_block)[0])
 }
 
 /// Compile a sub-expression, error-check it, then apply a callback function.
@@ -1045,29 +1657,27 @@ fn compile_with_error_check(
     inner: &ast::Expr,
     ctx_val: cranelift_codegen::ir::Value,
     ptr_type: Type,
+    policy_ctx: &PolicyTypeCtx,
     apply: impl FnOnce(&mut FunctionBuilder, cranelift_codegen::ir::Value, Type) -> cranelift_codegen::ir::Value,
 ) -> cranelift_codegen::ir::Value {
-    let val = compile_expr(builder, ctx, h, inner, ctx_val, ptr_type);
+    let inner_cv = compile_expr(builder, ctx, h, inner, ctx_val, ptr_type, policy_ctx);
+    let val = inner_cv.to_tagged(builder, ptr_type);
 
     let merge_block = builder.create_block();
     builder.append_block_param(merge_block, ptr_type);
 
-    let is_err = icall(builder, h.sig_ptr_to_u64, h.addr_is_error, &[val], ptr_type);
-    let zero = builder.ins().iconst(types::I64, 0);
-    let cmp = builder.ins().icmp(IntCC::NotEqual, is_err, zero);
-    let ok_block = builder.create_block();
+    // Inline error check instead of calling helper
     let error_block = builder.create_block();
-    builder.ins().brif(cmp, error_block, &[], ok_block, &[]);
+    emit_error_check_inline(builder, val, error_block);
+
+    let result = apply(builder, val, ptr_type);
+    builder.ins().jump(merge_block, &[result]);
 
     builder.switch_to_block(error_block);
     builder.seal_block(error_block);
-    let ev = icall(builder, h.sig_void_to_ptr, h.addr_error, &[], ptr_type);
+    let err_p = builder.ins().iconst(types::I64, 0);
+    let ev = emit_tagged(builder, TAG_ERROR, err_p, ptr_type);
     builder.ins().jump(merge_block, &[ev]);
-
-    builder.switch_to_block(ok_block);
-    builder.seal_block(ok_block);
-    let result = apply(builder, val, ptr_type);
-    builder.ins().jump(merge_block, &[result]);
 
     builder.switch_to_block(merge_block);
     builder.seal_block(merge_block);
@@ -1081,6 +1691,7 @@ fn compile_set(
     elements: &[ast::Expr],
     ctx_val: cranelift_codegen::ir::Value,
     ptr_type: Type,
+    policy_ctx: &PolicyTypeCtx,
 ) -> cranelift_codegen::ir::Value {
     let count = elements.len();
     if count == 0 {
@@ -1094,7 +1705,7 @@ fn compile_set(
     ));
 
     for (i, elem) in elements.iter().enumerate() {
-        let val = compile_expr(builder, ctx, h, elem, ctx_val, ptr_type);
+        let val = compile_expr(builder, ctx, h, elem, ctx_val, ptr_type, policy_ctx).to_tagged(builder, ptr_type);
         let is_err = icall(builder, h.sig_ptr_to_u64, h.addr_is_error, &[val], ptr_type);
         let zero = builder.ins().iconst(types::I64, 0);
         let cmp = builder.ins().icmp(IntCC::NotEqual, is_err, zero);
@@ -1124,6 +1735,7 @@ fn compile_record(
     fields: &BTreeMap<SmolStr, ast::Expr>,
     ctx_val: cranelift_codegen::ir::Value,
     ptr_type: Type,
+    policy_ctx: &PolicyTypeCtx,
 ) -> cranelift_codegen::ir::Value {
     let count = fields.len();
     if count == 0 {
@@ -1146,7 +1758,7 @@ fn compile_record(
         builder.ins().stack_store(ko_v, keys_slot, (i * 16) as i32);
         builder.ins().stack_store(kl_v, keys_slot, (i * 16 + 8) as i32);
 
-        let val = compile_expr(builder, ctx, h, val_expr, ctx_val, ptr_type);
+        let val = compile_expr(builder, ctx, h, val_expr, ctx_val, ptr_type, policy_ctx).to_tagged(builder, ptr_type);
         let is_err = icall(builder, h.sig_ptr_to_u64, h.addr_is_error, &[val], ptr_type);
         let zero = builder.ins().iconst(types::I64, 0);
         let cmp = builder.ins().icmp(IntCC::NotEqual, is_err, zero);
@@ -1178,6 +1790,7 @@ fn compile_ext_call(
     args: &[ast::Expr],
     ctx_val: cranelift_codegen::ir::Value,
     ptr_type: Type,
+    policy_ctx: &PolicyTypeCtx,
 ) -> cranelift_codegen::ir::Value {
     let name_str = fn_name.to_string();
     let (no, nl) = ctx.intern_string(&name_str);
@@ -1196,7 +1809,7 @@ fn compile_ext_call(
     ));
 
     for (i, arg) in args.iter().enumerate() {
-        let val = compile_expr(builder, ctx, h, arg, ctx_val, ptr_type);
+        let val = compile_expr(builder, ctx, h, arg, ctx_val, ptr_type, policy_ctx).to_tagged(builder, ptr_type);
         let is_err = icall(builder, h.sig_ptr_to_u64, h.addr_is_error, &[val], ptr_type);
         let zero = builder.ins().iconst(types::I64, 0);
         let cmp = builder.ins().icmp(IntCC::NotEqual, is_err, zero);

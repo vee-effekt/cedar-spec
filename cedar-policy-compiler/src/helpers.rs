@@ -21,8 +21,15 @@ const TAG_VALUE: u32 = 3; // complex value (String, EntityUID, Set, Record, Exte
 
 /// Runtime context passed to helper functions via a pointer.
 /// The JIT-compiled code receives this as its first argument.
+///
+/// IMPORTANT: `principal_data` and `resource_data` MUST be the first two fields
+/// so the JIT can load them at known offsets (0 and 8).
 #[repr(C)]
 pub struct RuntimeCtx {
+    /// Pointer to flat principal entity data, or null if unavailable
+    pub principal_data: *const u8,
+    /// Pointer to flat resource entity data, or null if unavailable
+    pub resource_data: *const u8,
     pub request: ast::Request,
     pub entities: Entities,
     pub extensions: &'static Extensions<'static>,
@@ -30,6 +37,9 @@ pub struct RuntimeCtx {
     pub interned_strings: Vec<(SmolStr, usize)>, // (string, offset) pairs for interned strings
     pub string_pool: Vec<u8>,                     // raw bytes of interned strings
 }
+
+unsafe impl Send for RuntimeCtx {}
+unsafe impl Sync for RuntimeCtx {}
 
 impl RuntimeCtx {
     pub fn new(
@@ -40,6 +50,29 @@ impl RuntimeCtx {
         string_pool: Vec<u8>,
     ) -> Self {
         Self {
+            principal_data: std::ptr::null(),
+            resource_data: std::ptr::null(),
+            request: request.clone(),
+            entities: entities.clone(),
+            extensions: Extensions::all_available(),
+            patterns,
+            interned_strings,
+            string_pool,
+        }
+    }
+
+    pub fn new_with_flat_data(
+        request: &ast::Request,
+        entities: &Entities,
+        principal_data: *const u8,
+        resource_data: *const u8,
+        patterns: Vec<ast::Pattern>,
+        interned_strings: Vec<(SmolStr, usize)>,
+        string_pool: Vec<u8>,
+    ) -> Self {
+        Self {
+            principal_data,
+            resource_data,
             request: request.clone(),
             entities: entities.clone(),
             extensions: Extensions::all_available(),

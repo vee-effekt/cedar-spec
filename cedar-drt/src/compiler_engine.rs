@@ -26,20 +26,29 @@ use cedar_testing::cedar_test_impl::{
 };
 
 use cedar_policy_compiler::helpers::RuntimeCtx;
+use cedar_policy_compiler::layout::CompiledEntityStore;
 use cedar_policy_compiler::Compiler;
 use miette::miette;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
 
 pub struct CedarCompilerEngine {
     compiler: Compiler,
+    schema: RefCell<Option<Schema>>,
 }
 
 impl CedarCompilerEngine {
     pub fn new() -> Self {
         Self {
             compiler: Compiler::new(),
+            schema: RefCell::new(None),
         }
+    }
+
+    pub fn set_schema(&self, schema: &Schema) {
+        *self.schema.borrow_mut() = Some(schema.clone());
     }
 }
 
@@ -53,9 +62,10 @@ impl CedarTestImplementation for CedarCompilerEngine {
         let start = Instant::now();
 
         let core_pset: &ast::PolicySet = policies.as_ref();
-        let conditions: Vec<ast::Expr> = core_pset.policies().map(|p| p.condition()).collect();
+        let core_policies: Vec<&ast::Policy> = core_pset.policies().collect();
 
-        let compiled = match self.compiler.compile_conditions(&conditions) {
+        let schema_ref = self.schema.borrow();
+        let compiled = match self.compiler.compile_conditions(&core_policies, schema_ref.as_ref()) {
             Ok(c) => c,
             Err(e) => return TestResult::Failure(format!("Compilation error: {}", e)),
         };
@@ -63,13 +73,42 @@ impl CedarTestImplementation for CedarCompilerEngine {
         // Create runtime context with request and entities
         let core_request: &ast::Request = request.as_ref();
         let core_entities: &CoreEntities = entities.as_ref();
-        let runtime_ctx = RuntimeCtx::new(
-            core_request,
-            core_entities,
-            compiled.patterns.clone(),
-            compiled.interned_strings.clone(),
-            compiled.string_pool.clone(),
-        );
+
+        // Build compiled entity store if schema layout is available
+        let entity_store = compiled.schema_layout.as_ref().map(|layout| {
+            CompiledEntityStore::new(Arc::clone(layout), core_entities)
+        });
+
+        let runtime_ctx = if let Some(ref store) = entity_store {
+            // Schema-directed: pre-resolve principal/resource pointers
+            let principal_data = core_request
+                .principal()
+                .uid()
+                .map(|uid| store.get(uid))
+                .unwrap_or(std::ptr::null());
+            let resource_data = core_request
+                .resource()
+                .uid()
+                .map(|uid| store.get(uid))
+                .unwrap_or(std::ptr::null());
+            RuntimeCtx::new_with_flat_data(
+                core_request,
+                core_entities,
+                principal_data,
+                resource_data,
+                compiled.patterns.clone(),
+                compiled.interned_strings.clone(),
+                compiled.string_pool.clone(),
+            )
+        } else {
+            RuntimeCtx::new(
+                core_request,
+                core_entities,
+                compiled.patterns.clone(),
+                compiled.interned_strings.clone(),
+                compiled.string_pool.clone(),
+            )
+        };
         let ctx_ptr = &runtime_ctx as *const RuntimeCtx;
 
         let mut satisfied_permits = vec![];
