@@ -6,8 +6,14 @@ edition = "2021"
 [dependencies]
 cedar-policy = "4.4.0"
 cedar-policy-core = { version = "4.4.0", features = ["arbitrary"] }
+cranelift = "0.116"
+cranelift-jit = "0.116"
+cranelift-module = "0.116"
+cranelift-codegen = "0.116"
+cranelift-frontend = "0.116"
+cranelift-native = "0.116"
+target-lexicon = "0.13"
 smol_str = "0.3"
-tempfile = "3"
 
 [patch.crates-io]
 cedar-policy = { path = "../cedar/cedar-policy" }
