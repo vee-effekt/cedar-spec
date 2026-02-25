@@ -1,62 +1,15 @@
 You are a compiler engineer.
 
-You are implementing a compiler for the Cedar programming language. Cedar is an open-source authorization policy language; the reference implementations below are your oracle for behavior. Familiarize yourself with the contents of `cedar-drt`, and `cedar-lean`, and `cedar` thoroughly.
+Your task is to write a compiler for the [Cedar programming language](https://www.cedarpolicy.com). First, familiarize yourself thoroughly with the language. In particular, pay attention to the interpreters in Rust and Lean, which serve as an operational semantics of the language.
 
-Cedar has several interpreters available already, but it lacks a compiler. This is your job to produce. The compiler should emit Rust code equivalent to the original Cedar, which will then be compiled and run as Wasm. It will be validated by differential testing: random policies, requests, and entity hierarchies are generated and run through (a) the Cedar Rust interpreter, (b) the executable Lean specification, and (c) your compiler. If any of the three disagrees on even a single test case, the test fails.
+The compiler must be written in Rust. It should take Cedar policy source text and emit native AArch64 machine code.
 
-When the compiler disagrees with either interpreter, the failing test case is saved to `cedar-drt/fuzz/failures/compiler/` (override with `COMPILER_FAILURES_DIR`). Each failure is a directory containing:
-- `policy.cedar` — the policy text
-- `entities.json` — entities in Cedar JSON format
-- `test.json` — request and expected decision in Cedar integration test format
+Cedar policies are evaluated against an entity store, which is a runtime dependency. The compiled code should call into it to look up entity attributes and to answer `in`——ancestor——queries over the entity hierarchy. The compiler should inline the extension types (ipaddr, decimal, datetime/duration) rather than calling out to a runtime library, where possible.
 
-To replay all saved failures:
-```
-cargo test -p cedar-drt --test replay_compiler_failures
-```
+To test your implementation, you are encouraged to use the differential testing harness located in `cedar-drt`. In particular, `cedar-drt/fuzz/fuzz_targets/abac-compiler.rs` contains a 3-way testing target which will differentially test the results of your compiler implementation against the Rust and Lean interpreters on a series of randomly generated inputs, namely a schema, an entity hierarchy, a policy, and some requests. If your implementation fails on any input, save these generated inputs and rerun them as you attempt to fix the code. Creating the architecture to do this is up to you.
 
-## Reference implementations (your behavioral oracle)
+Once your implementation works reasonably well, extensively test it using the differential testing harness. 
 
-**Rust interpreter:**
-- `cedar-drt/cedar-policy-core/src/evaluator.rs` — the expression evaluator
-- `cedar-drt/cedar-policy-core/src/authorizer.rs` — the authorization loop
-- `cedar-drt/cedar-policy-core/src/ast/policy.rs` — how scope + conditions become a single expression
+Finally, I want to know how much all of this costs. When you get close to compaction, run the /cost skill and output the results to a file.
 
-**Lean specification:**
-- `cedar-lean/Cedar/Spec/Evaluator.lean` — the expression evaluator
-- `cedar-lean/Cedar/Spec/Authorizer.lean` — `isAuthorized`
-- `cedar-lean/Cedar/Spec/Policy.lean` — `Policy.toExpr`
-
-**Test harness:**
-- `cedar-drt/src/compiler_engine.rs` — how your compiler output gets called
-- `cedar-drt/src/tests.rs` — three-way comparison (Rust vs Lean vs compiler)
-
-## Accessing the Cedar AST
-
-```rust
-use cedar_policy_core::ast::{self, ExprKind, Literal, Var, BinaryOp, UnaryOp};
-
-let policy = cedar_policy::Policy::parse(None, policy_text)?;
-let ast_policy: &ast::Policy = policy.as_ref();
-let condition: ast::Expr = ast_policy.condition();
-```
-
-`condition()` returns the complete expression tree — scope constraints AND'd with the when/unless body. Because `&&` short-circuits, if scope fails the body is never evaluated.
-
-Access expression nodes with `expr.expr_kind()` → `&ExprKind`. The variants:
-
-```
-Lit(Literal)           Var(Var)              Slot(SlotId)          Unknown(Unknown)
-If { test_expr, then_expr, else_expr }
-And { left, right }    Or { left, right }
-UnaryApp { op, arg }                         // Not, Neg, IsEmpty
-BinaryApp { op, arg1, arg2 }                 // Eq, Less, LessEq, Add, Sub, Mul, In,
-                                             // Contains, ContainsAll, ContainsAny, GetTag, HasTag
-ExtensionFunctionApp { fn_name, args }
-GetAttr { expr, attr }  HasAttr { expr, attr }
-Like { expr, pattern }  Is { expr, entity_type }
-Set(elements)           Record(fields)
-```
-
-## What to emit
-
-Your compiler emits Rust source code. Walk the expression tree and produce a Rust function body that evaluates the policy against a request and entity store, returning `Value`. Structure the compiler as a recursive `compile_expr` that pattern-matches on `ExprKind` and emits the corresponding Rust code string for each node.
+Good luck!

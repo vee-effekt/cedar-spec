@@ -29,26 +29,77 @@ use cedar_policy_compiler::helpers::RuntimeCtx;
 use cedar_policy_compiler::layout::CompiledEntityStore;
 use cedar_policy_compiler::Compiler;
 use miette::miette;
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Function signature for compiled native policy code.
+/// Returns: 1 = satisfied, 0 = not satisfied, 2 = error.
+type EvaluateFn = unsafe extern "C" fn() -> i64;
+
 pub struct CedarCompilerEngine {
     compiler: Compiler,
-    schema: RefCell<Option<Schema>>,
 }
 
 impl CedarCompilerEngine {
     pub fn new() -> Self {
         Self {
             compiler: Compiler::new(),
-            schema: RefCell::new(None),
         }
     }
 
-    pub fn set_schema(&self, schema: &Schema) {
-        *self.schema.borrow_mut() = Some(schema.clone());
+    /// Compile a policy to native AArch64 machine code and measure timing.
+    /// Returns the machine code bytes and compilation time in nanoseconds.
+    fn compile_policy_timed(&self, policy_text: &str) -> Result<(Vec<u8>, u128), String> {
+        let start = Instant::now();
+        let code = self
+            .compiler
+            .compile_str(policy_text)
+            .map_err(|e| e.to_string())?;
+        let duration = start.elapsed().as_nanos();
+        Ok((code, duration))
+    }
+
+    /// Load compiled AArch64 machine code into an executable memory region and call it.
+    /// Returns (decision as i64, execution time in ns).
+    fn execute_native(&self, code: &[u8]) -> Result<(i64, u128), String> {
+        use std::ptr;
+
+        let start = Instant::now();
+
+        // Allocate a page-aligned RW region, copy the code, then mark it RX.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let alloc_size = (code.len() + page_size - 1) & !(page_size - 1);
+
+        let mem = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                alloc_size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if mem == libc::MAP_FAILED {
+            return Err("mmap failed".to_string());
+        }
+
+        unsafe { ptr::copy_nonoverlapping(code.as_ptr(), mem as *mut u8, code.len()) };
+
+        let rc = unsafe { libc::mprotect(mem, alloc_size, libc::PROT_READ | libc::PROT_EXEC) };
+        if rc != 0 {
+            unsafe { libc::munmap(mem, alloc_size) };
+            return Err("mprotect failed".to_string());
+        }
+
+        let f: EvaluateFn = unsafe { std::mem::transmute(mem) };
+        let decision = unsafe { f() };
+
+        unsafe { libc::munmap(mem, alloc_size) };
+
+        let duration = start.elapsed().as_nanos();
+        Ok((decision, duration))
     }
 }
 
@@ -59,6 +110,7 @@ impl CedarTestImplementation for CedarCompilerEngine {
         policies: &PolicySet,
         entities: &Entities,
     ) -> TestResult<TestResponse> {
+<<<<<<< HEAD
         let start = Instant::now();
 
         let core_pset: &ast::PolicySet = policies.as_ref();
@@ -110,11 +162,20 @@ impl CedarTestImplementation for CedarCompilerEngine {
             )
         };
         let ctx_ptr = &runtime_ctx as *const RuntimeCtx;
+=======
+        // Each policy is compiled to native AArch64 and executed individually.
+        // The evaluate function returns: 1 = satisfied, 0 = not satisfied, 2 = error.
+        // The engine applies Cedar authorization semantics on top:
+        //   - If any satisfied forbid → Deny (forbid overrides permit)
+        //   - Else if any satisfied permit → Allow
+        //   - Else → Deny (default deny)
+>>>>>>> e5882dd (fresh)
 
         let mut satisfied_permits = vec![];
         let mut satisfied_forbids = vec![];
         let mut errors = vec![];
 
+<<<<<<< HEAD
         for (i, (policy, _core_policy)) in policies.policies().zip(core_pset.policies()).enumerate() {
             let decision = compiled.call(i, ctx_ptr);
 
@@ -141,6 +202,57 @@ impl CedarTestImplementation for CedarCompilerEngine {
                     return TestResult::Failure(format!(
                         "Policy {} returned unknown decision value: {}",
                         policy.id(), n
+=======
+        for policy in policies.policies() {
+            let policy_id = policy.id();
+            let policy_text = policy.to_string();
+            let is_forbid = policy.effect() == Effect::Forbid;
+
+            let code = match self.compile_policy_timed(&policy_text) {
+                Ok((bytes, compile_time)) => {
+                    compile_time_total += compile_time;
+                    bytes
+                }
+                Err(err) => {
+                    return TestResult::Failure(format!(
+                        "Failed to compile policy {}: {}",
+                        policy_id, err
+                    ));
+                }
+            };
+
+            match self.execute_native(&code) {
+                Ok((decision_value, exec_time)) => {
+                    eval_time_total += exec_time;
+
+                    match decision_value {
+                        1 => {
+                            if is_forbid {
+                                satisfied_forbids.push(policy_id.clone());
+                            } else {
+                                satisfied_permits.push(policy_id.clone());
+                            }
+                        }
+                        0 => {}
+                        2 => {
+                            errors.push(ffi::AuthorizationError::new_from_report(
+                                policy_id.clone(),
+                                miette!("Policy evaluation returned error"),
+                            ));
+                        }
+                        _ => {
+                            return TestResult::Failure(format!(
+                                "Policy {} returned unknown decision value: {}",
+                                policy_id, decision_value
+                            ));
+                        }
+                    }
+                }
+                Err(err) => {
+                    return TestResult::Failure(format!(
+                        "Failed to execute native code for policy {}: {}",
+                        policy_id, err
+>>>>>>> e5882dd (fresh)
                     ));
                 }
             }
