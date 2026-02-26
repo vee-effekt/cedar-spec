@@ -16,6 +16,7 @@ use crate::asm::*;
 use crate::runtime::*;
 use cedar_policy_core::ast::{self, BinaryOp, EntityUID, ExprKind, Literal, Pattern, UnaryOp, Var};
 use smol_str::SmolStr;
+use std::collections::BTreeMap;
 
 pub struct ExprCompiler {
     buf: CodeBuffer,
@@ -59,12 +60,9 @@ impl ExprCompiler {
     ///
     /// The returned `CompiledCode` must be kept alive as long as the compiled code is executable,
     /// because the machine code contains embedded pointers into the pinned data.
-    ///
-    /// The `condition` is taken as a `Box<ast::Expr>` so it can be stored alongside the
-    /// compiled code (the machine code embeds pointers into the AST for fallback evaluation).
-    pub fn compile_condition(mut self, expr: Box<ast::Expr>) -> CompiledCode {
+    pub fn compile_condition(mut self, expr: &ast::Expr) -> CompiledCode {
         self.emit_prologue();
-        self.emit_expr(&expr);
+        self.emit_expr(expr);
         self.emit_epilogue();
         let code = self.buf.finish();
         CompiledCode {
@@ -75,7 +73,6 @@ impl ExprCompiler {
             _entity_literals: self.entity_literals,
             _string_literals: self.string_literals,
             _entity_type_literals: self.entity_type_literals,
-            _condition: expr,
         }
     }
 
@@ -104,7 +101,8 @@ impl ExprCompiler {
         // STP x23, x24, [SP, #48]
         self.buf.stp_offset(X23, X24, SP, 48);
         // MOV x29, SP (frame pointer)
-        self.buf.mov_reg(X29, SP);
+        // Note: use add_imm since mov_reg(ORR) treats reg 31 as XZR, not SP
+        self.buf.add_imm(X29, SP, 0);
         // Save ctx (x0) to x19
         self.buf.mov_reg(X19, X0);
     }
@@ -153,24 +151,20 @@ impl ExprCompiler {
             } => self.emit_if(test_expr, then_expr, else_expr),
             ExprKind::And { left, right } => self.emit_and(left, right),
             ExprKind::Or { left, right } => self.emit_or(left, right),
-            ExprKind::UnaryApp { op, arg } => self.emit_unary(*op, arg, expr),
-            ExprKind::BinaryApp { op, arg1, arg2 } => self.emit_binary(*op, arg1, arg2, expr),
-            // For complex expression types, fall back to the Rust interpreter.
-            // This ensures correctness while still getting native code for the
-            // common control flow (and/or/if) and simple operations.
-            _ => self.emit_eval_fallback(expr),
+            ExprKind::UnaryApp { op, arg } => self.emit_unary(*op, arg),
+            ExprKind::BinaryApp { op, arg1, arg2 } => self.emit_binary(*op, arg1, arg2),
+            ExprKind::ExtensionFunctionApp { fn_name, args } => {
+                self.emit_extension_call(fn_name, args)
+            }
+            ExprKind::GetAttr { expr, attr } => self.emit_get_attr(expr, attr),
+            ExprKind::HasAttr { expr, attr } => self.emit_has_attr(expr, attr),
+            ExprKind::Like { expr, pattern } => self.emit_like(expr, pattern),
+            ExprKind::Set(elements) => self.emit_set(elements),
+            ExprKind::Record(fields) => self.emit_record(fields),
+            ExprKind::Is { expr, entity_type } => self.emit_is(expr, entity_type),
+            // Error nodes in the AST
+            _ => self.emit_error(),
         }
-    }
-
-    /// Emit a call to rt_eval_expr, which uses the Rust interpreter to evaluate
-    /// the expression. The Expr pointer is embedded in the machine code.
-    fn emit_eval_fallback(&mut self, expr: &ast::Expr) {
-        let expr_ptr = expr as *const ast::Expr as u64;
-        // rt_eval_expr(ctx, expr_ptr) -> RuntimeValue
-        self.buf.mov_reg(X0, X19); // ctx
-        self.buf.mov_imm64(X1, expr_ptr);
-        self.buf.mov_imm64(X8, rt_eval_expr as u64);
-        self.buf.blr(X8);
     }
 
     // ---- Literal emission ----
@@ -329,31 +323,31 @@ impl ExprCompiler {
 
     // ---- Unary operations ----
 
-    fn emit_unary(&mut self, op: UnaryOp, arg: &ast::Expr, full_expr: &ast::Expr) {
+    fn emit_unary(&mut self, op: UnaryOp, arg: &ast::Expr) {
+        self.emit_expr(arg);
         match op {
-            UnaryOp::Not => {
-                self.emit_expr(arg);
-                self.call_fn2(rt_not as u64);
-            }
-            UnaryOp::Neg => {
-                self.emit_expr(arg);
-                self.call_fn2(rt_neg as u64);
-            }
-            // IsEmpty on sets — use fallback
-            UnaryOp::IsEmpty => self.emit_eval_fallback(full_expr),
+            UnaryOp::Not => self.call_fn2(rt_not as u64),
+            UnaryOp::Neg => self.call_fn2(rt_neg as u64),
+            UnaryOp::IsEmpty => self.call_fn2(rt_is_empty as u64),
         }
     }
 
     // ---- Binary operations ----
 
-    fn emit_binary(&mut self, op: BinaryOp, left: &ast::Expr, right: &ast::Expr, full_expr: &ast::Expr) {
+    fn emit_binary(&mut self, op: BinaryOp, left: &ast::Expr, right: &ast::Expr) {
         match op {
             BinaryOp::Eq => self.emit_binary_with_ctx(left, right, rt_eq as u64),
+            BinaryOp::Less => self.emit_binary_with_ctx(left, right, rt_less as u64),
+            BinaryOp::LessEq => self.emit_binary_with_ctx(left, right, rt_less_eq as u64),
             BinaryOp::Add => self.emit_binary_4arg(left, right, rt_add as u64),
             BinaryOp::Sub => self.emit_binary_4arg(left, right, rt_sub as u64),
             BinaryOp::Mul => self.emit_binary_4arg(left, right, rt_mul as u64),
-            // For complex binary ops, use the interpreter fallback
-            _ => self.emit_eval_fallback(full_expr),
+            BinaryOp::In => self.emit_binary_with_ctx(left, right, rt_in as u64),
+            BinaryOp::Contains => self.emit_binary_with_ctx(left, right, rt_contains as u64),
+            BinaryOp::ContainsAll => self.emit_binary_4arg(left, right, rt_contains_all as u64),
+            BinaryOp::ContainsAny => self.emit_binary_4arg(left, right, rt_contains_any as u64),
+            BinaryOp::GetTag => self.emit_binary_with_ctx(left, right, rt_get_tag as u64),
+            BinaryOp::HasTag => self.emit_binary_with_ctx(left, right, rt_has_tag as u64),
         }
     }
 
@@ -406,6 +400,169 @@ impl ExprCompiler {
 
         self.buf.mov_imm64(X8, func);
         self.buf.blr(X8);
+    }
+
+    // ---- Attribute operations ----
+
+    fn emit_get_attr(&mut self, expr: &ast::Expr, attr: &SmolStr) {
+        self.emit_expr(expr);
+        let attr_idx = self.intern_string_literal(attr.clone());
+        let attr_ptr = &*self.string_literals[attr_idx] as *const SmolStr as u64;
+        // rt_get_attr(ctx, tag, payload, attr_ptr)
+        self.buf.mov_reg(X2, X1); // payload -> x2
+        self.buf.mov_reg(X1, X0); // tag -> x1
+        self.buf.mov_reg(X0, X19); // ctx -> x0
+        self.buf.mov_imm64(X3, attr_ptr);
+        self.buf.mov_imm64(X8, rt_get_attr as u64);
+        self.buf.blr(X8);
+    }
+
+    fn emit_has_attr(&mut self, expr: &ast::Expr, attr: &SmolStr) {
+        self.emit_expr(expr);
+        let attr_idx = self.intern_string_literal(attr.clone());
+        let attr_ptr = &*self.string_literals[attr_idx] as *const SmolStr as u64;
+        // rt_has_attr(ctx, tag, payload, attr_ptr)
+        self.buf.mov_reg(X2, X1);
+        self.buf.mov_reg(X1, X0);
+        self.buf.mov_reg(X0, X19);
+        self.buf.mov_imm64(X3, attr_ptr);
+        self.buf.mov_imm64(X8, rt_has_attr as u64);
+        self.buf.blr(X8);
+    }
+
+    // ---- Like (pattern matching) ----
+
+    fn emit_like(&mut self, expr: &ast::Expr, pattern: &Pattern) {
+        self.emit_expr(expr);
+        let pattern_idx = self.patterns.len();
+        self.patterns.push(pattern.clone());
+        // rt_like(ctx, tag, payload, pattern_idx)
+        self.buf.mov_reg(X2, X1);
+        self.buf.mov_reg(X1, X0);
+        self.buf.mov_reg(X0, X19);
+        self.buf.mov_imm64(X3, pattern_idx as u64);
+        self.buf.mov_imm64(X8, rt_like as u64);
+        self.buf.blr(X8);
+    }
+
+    // ---- Is (entity type check) ----
+
+    fn emit_is(&mut self, expr: &ast::Expr, entity_type: &ast::EntityType) {
+        self.emit_expr(expr);
+        let idx = self.entity_type_literals.len();
+        self.entity_type_literals.push(Box::new(entity_type.clone()));
+        let type_ptr = &*self.entity_type_literals[idx] as *const ast::EntityType as u64;
+        // rt_is_entity_type(tag, payload, type_ptr)
+        self.buf.mov_imm64(X2, type_ptr);
+        self.buf.mov_imm64(X8, rt_is_entity_type as u64);
+        self.buf.blr(X8);
+    }
+
+    // ---- Set construction ----
+
+    fn emit_set(&mut self, elements: &[ast::Expr]) {
+        let count = elements.len();
+        if count == 0 {
+            self.buf.mov_reg(X0, X19);
+            self.buf.movz(X1, 0, 0);
+            self.buf.movz(X2, 0, 0);
+            self.buf.movz(X3, 0, 0);
+            self.buf.mov_imm64(X8, rt_make_set as u64);
+            self.buf.blr(X8);
+            return;
+        }
+        let array_size = (count * 8 + 15) & !15; // 16-byte aligned
+        let total_stack = array_size * 2;
+        self.buf.sub_imm(SP, SP, total_stack as u32);
+        for (i, elem) in elements.iter().enumerate() {
+            self.emit_expr(elem);
+            self.buf.str_imm(X0, SP, (i * 8) as u32);
+            self.buf.str_imm(X1, SP, (array_size + i * 8) as u32);
+        }
+        // rt_make_set(ctx, tags, payloads, count)
+        // Note: mov_reg cannot move SP (register 31 is XZR in ORR).
+        // Use add_imm(Xd, SP, 0) instead.
+        self.buf.mov_reg(X0, X19);
+        self.buf.add_imm(X1, SP, 0);
+        self.buf.add_imm(X2, SP, array_size as u32);
+        self.buf.mov_imm64(X3, count as u64);
+        self.buf.mov_imm64(X8, rt_make_set as u64);
+        self.buf.blr(X8);
+        self.buf.add_imm(SP, SP, total_stack as u32);
+    }
+
+    // ---- Record construction ----
+
+    fn emit_record(&mut self, fields: &BTreeMap<SmolStr, ast::Expr>) {
+        let count = fields.len();
+        if count == 0 {
+            self.buf.mov_reg(X0, X19);
+            self.buf.movz(X1, 0, 0);
+            self.buf.movz(X2, 0, 0);
+            self.buf.movz(X3, 0, 0);
+            self.buf.movz(X4, 0, 0);
+            self.buf.mov_imm64(X8, rt_make_record as u64);
+            self.buf.blr(X8);
+            return;
+        }
+        let array_size = (count * 8 + 15) & !15;
+        let total_stack = array_size * 3;
+        self.buf.sub_imm(SP, SP, total_stack as u32);
+        for (i, (key, val_expr)) in fields.iter().enumerate() {
+            let key_idx = self.intern_string_literal(key.clone());
+            let key_ptr = &*self.string_literals[key_idx] as *const SmolStr as u64;
+            self.buf.mov_imm64(X8, key_ptr);
+            self.buf.str_imm(X8, SP, (i * 8) as u32);
+            self.emit_expr(val_expr);
+            self.buf.str_imm(X0, SP, (array_size + i * 8) as u32);
+            self.buf.str_imm(X1, SP, (2 * array_size + i * 8) as u32);
+        }
+        // rt_make_record(ctx, keys, tags, payloads, count)
+        // Note: use add_imm to read SP (mov_reg treats reg 31 as XZR)
+        self.buf.mov_reg(X0, X19);
+        self.buf.add_imm(X1, SP, 0);
+        self.buf.add_imm(X2, SP, array_size as u32);
+        self.buf.add_imm(X3, SP, (2 * array_size) as u32);
+        self.buf.mov_imm64(X4, count as u64);
+        self.buf.mov_imm64(X8, rt_make_record as u64);
+        self.buf.blr(X8);
+        self.buf.add_imm(SP, SP, total_stack as u32);
+    }
+
+    // ---- Extension function calls ----
+
+    fn emit_extension_call(&mut self, fn_name: &ast::Name, args: &[ast::Expr]) {
+        let name_str = fn_name.to_string();
+        let fn_name_idx = self.intern_extension_name(name_str);
+        let count = args.len();
+        if count == 0 {
+            self.buf.mov_reg(X0, X19);
+            self.buf.mov_imm64(X1, fn_name_idx as u64);
+            self.buf.movz(X2, 0, 0);
+            self.buf.movz(X3, 0, 0);
+            self.buf.movz(X4, 0, 0);
+            self.buf.mov_imm64(X8, rt_call_extension as u64);
+            self.buf.blr(X8);
+            return;
+        }
+        let array_size = (count * 8 + 15) & !15;
+        let total_stack = array_size * 2;
+        self.buf.sub_imm(SP, SP, total_stack as u32);
+        for (i, arg) in args.iter().enumerate() {
+            self.emit_expr(arg);
+            self.buf.str_imm(X0, SP, (i * 8) as u32);
+            self.buf.str_imm(X1, SP, (array_size + i * 8) as u32);
+        }
+        // rt_call_extension(ctx, fn_name_idx, args_tags, args_payloads, n_args)
+        // Note: use add_imm to read SP (mov_reg treats reg 31 as XZR)
+        self.buf.mov_reg(X0, X19);
+        self.buf.mov_imm64(X1, fn_name_idx as u64);
+        self.buf.add_imm(X2, SP, 0);
+        self.buf.add_imm(X3, SP, array_size as u32);
+        self.buf.mov_imm64(X4, count as u64);
+        self.buf.mov_imm64(X8, rt_call_extension as u64);
+        self.buf.blr(X8);
+        self.buf.add_imm(SP, SP, total_stack as u32);
     }
 
     // ---- Error emission ----
@@ -464,6 +621,16 @@ impl ExprCompiler {
         idx
     }
 
+    fn intern_extension_name(&mut self, name: String) -> usize {
+        for (i, existing) in self.interned_strings.iter().enumerate() {
+            if *existing == name {
+                return i;
+            }
+        }
+        let idx = self.interned_strings.len();
+        self.interned_strings.push(name);
+        idx
+    }
 }
 
 /// Compiled code with its associated pinned data.
@@ -478,9 +645,6 @@ pub struct CompiledCode {
     pub _entity_literals: Vec<Box<EntityUID>>,
     pub _string_literals: Vec<Box<SmolStr>>,
     pub _entity_type_literals: Vec<Box<ast::EntityType>>,
-    // The original condition expression. The machine code may embed pointers into
-    // sub-expressions for rt_eval_expr fallback.
-    pub _condition: Box<ast::Expr>,
 }
 
 // Add STP/LDP with unsigned offset to CodeBuffer

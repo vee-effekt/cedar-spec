@@ -116,6 +116,9 @@ impl CedarTestImplementation for CedarCompilerEngine {
 
         let pub_policies: Vec<_> = policies.policies().collect();
         for (i, policy) in pub_policies.iter().enumerate() {
+            if std::env::var("COMPILER_DEBUG").is_ok() {
+                eprintln!("  calling evaluate_{} ...", i);
+            }
             let decision = compiled.call(i, ctx_ptr);
 
             if std::env::var("COMPILER_DEBUG").is_ok() {

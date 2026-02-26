@@ -344,29 +344,31 @@ pub extern "C" fn rt_get_attr(ctx: *const RuntimeCtx, tag: u64, payload: u64, at
 }
 
 #[no_mangle]
-pub extern "C" fn rt_has_tag(ctx: *const RuntimeCtx, tag: u64, payload: u64, tag_name_ptr: *const SmolStr) -> RuntimeValue {
+pub extern "C" fn rt_has_tag(ctx: *const RuntimeCtx, entity_tag: u64, entity_payload: u64, name_tag: u64, name_payload: u64) -> RuntimeValue {
     let ctx = unsafe { &*ctx };
-    if tag != TAG_ENTITY {
+    if entity_tag != TAG_ENTITY || name_tag != TAG_STRING {
         return RuntimeValue::error();
     }
-    let uid = unsafe { &*(payload as *const EntityUID) };
-    let tag_name = unsafe { &*tag_name_ptr };
+    let uid = unsafe { &*(entity_payload as *const EntityUID) };
+    let tag_name = unsafe { &*(name_payload as *const SmolStr) };
     match ctx.entities.entity(uid) {
         Dereference::Data(entity) => {
             RuntimeValue::bool_val(entity.get_tag(tag_name).is_some())
         }
+        // hasTag on non-existent entity returns false (not error), matching the Rust evaluator
+        Dereference::NoSuchEntity => RuntimeValue::bool_val(false),
         _ => RuntimeValue::error(),
     }
 }
 
 #[no_mangle]
-pub extern "C" fn rt_get_tag(ctx: *const RuntimeCtx, tag: u64, payload: u64, tag_name_ptr: *const SmolStr) -> RuntimeValue {
+pub extern "C" fn rt_get_tag(ctx: *const RuntimeCtx, entity_tag: u64, entity_payload: u64, name_tag: u64, name_payload: u64) -> RuntimeValue {
     let ctx = unsafe { &*ctx };
-    if tag != TAG_ENTITY {
+    if entity_tag != TAG_ENTITY || name_tag != TAG_STRING {
         return RuntimeValue::error();
     }
-    let uid = unsafe { &*(payload as *const EntityUID) };
-    let tag_name = unsafe { &*tag_name_ptr };
+    let uid = unsafe { &*(entity_payload as *const EntityUID) };
+    let tag_name = unsafe { &*(name_payload as *const SmolStr) };
     match ctx.entities.entity(uid) {
         Dereference::Data(entity) => {
             match entity.get_tag(tag_name) {
@@ -608,20 +610,3 @@ pub fn value_to_runtime(ctx: &RuntimeCtx, val: &ast::Value) -> RuntimeValue {
     }
 }
 
-/// Runtime fallback: evaluate a Cedar expression using the Rust interpreter.
-/// Used for complex expressions (sets, records, extension calls) that are hard
-/// to generate native code for.
-#[no_mangle]
-pub extern "C" fn rt_eval_expr(ctx: *const RuntimeCtx, expr_ptr: *const ast::Expr) -> RuntimeValue {
-    let ctx = unsafe { &*ctx };
-    let expr = unsafe { &*expr_ptr };
-    use cedar_policy_core::evaluator::Evaluator;
-    use cedar_policy_core::extensions::Extensions;
-    let exts = Extensions::all_available();
-    let eval = Evaluator::new(ctx.request.clone(), ctx.entities, exts);
-    let slots = std::collections::HashMap::new();
-    match eval.interpret(expr, &slots) {
-        Ok(val) => value_to_runtime(ctx, &val),
-        Err(_) => RuntimeValue::error(),
-    }
-}

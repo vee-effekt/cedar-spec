@@ -44,9 +44,9 @@ impl Compiler {
         if policies.is_empty() {
             return Err(CompileError("No policies found".into()));
         }
-        let condition = Box::new(policies[0].condition());
+        let condition = policies[0].condition();
         let compiler = ExprCompiler::new();
-        let compiled = compiler.compile_condition(condition);
+        let compiled = compiler.compile_condition(&condition);
         Ok(compiled.code)
     }
 
@@ -63,9 +63,9 @@ impl Compiler {
         let mut all_string_pool = Vec::new();
 
         for policy in policies {
-            let condition = Box::new(policy.condition());
+            let condition = policy.condition();
             let compiler = ExprCompiler::new();
-            let compiled = compiler.compile_condition(condition);
+            let compiled = compiler.compile_condition(&condition);
 
             let exec_mem = ExecutableMemory::new(&compiled.code)
                 .map_err(|e| CompileError(format!("Failed to map executable memory: {}", e)))?;
@@ -80,11 +80,9 @@ impl Compiler {
             entries.push(CompiledEntry {
                 _exec_mem: exec_mem,
                 func_ptr,
-                // Keep the pinned data alive
                 _entity_literals: compiled._entity_literals,
                 _string_literals: compiled._string_literals,
                 _entity_type_literals: compiled._entity_type_literals,
-                _condition: compiled._condition,
             });
         }
 
@@ -105,8 +103,6 @@ struct CompiledEntry {
     _entity_literals: Vec<Box<ast::EntityUID>>,
     _string_literals: Vec<Box<SmolStr>>,
     _entity_type_literals: Vec<Box<ast::EntityType>>,
-    // The original condition expression — machine code may embed pointers to sub-expressions
-    _condition: Box<ast::Expr>,
 }
 
 // Safety: function pointers to executable memory are safe to share.

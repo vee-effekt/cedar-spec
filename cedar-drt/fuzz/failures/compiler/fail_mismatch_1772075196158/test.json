@@ -1,0 +1,30 @@
+{
+  "policies": "policy.cedar",
+  "entities": "entities.json",
+  "schema": "",
+  "shouldValidate": false,
+  "requests": [
+    {
+      "description": "Compiler mismatch failure",
+      "principal": {
+        "type": "r::V::B::r::a",
+        "id": "\u0000\u0000\u0000EFGHIJ&"
+      },
+      "action": {
+        "type": "r::V::B::r::Action",
+        "id": "action"
+      },
+      "resource": {
+        "type": "r::V::B::r::a",
+        "id": "\u0000\u0000\u0000EFGHIJ&"
+      },
+      "context": {
+        "_hL": []
+      },
+      "validateRequest": false,
+      "decision": "deny",
+      "reason": [],
+      "errors": []
+    }
+  ]
+}

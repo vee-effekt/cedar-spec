@@ -1,0 +1,10 @@
+[
+  {
+    "uid": {
+      "type": "r::V::B::r::Action",
+      "id": "action"
+    },
+    "attrs": {},
+    "parents": []
+  }
+]
