@@ -7,6 +7,13 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+/// Our own IP address representation, matching Cedar's private IPAddr struct.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompilerIpAddr {
+    pub addr: std::net::IpAddr,
+    pub prefix: u8,
+}
+
 pub struct RuntimeCtx<'a> {
     pub request: &'a ast::Request,
     pub entities: &'a Entities,
@@ -25,6 +32,7 @@ pub struct RuntimeCtx<'a> {
     temp_sets: RefCell<Vec<Box<BTreeSet<Value>>>>,
     temp_records: RefCell<Vec<Box<BTreeMap<SmolStr, Value>>>>,
     temp_exts: RefCell<Vec<Box<Value>>>,
+    temp_ipaddrs: RefCell<Vec<Box<CompilerIpAddr>>>,
 }
 
 impl<'a> RuntimeCtx<'a> {
@@ -48,6 +56,7 @@ impl<'a> RuntimeCtx<'a> {
             temp_sets: RefCell::new(Vec::new()),
             temp_records: RefCell::new(Vec::new()),
             temp_exts: RefCell::new(Vec::new()),
+            temp_ipaddrs: RefCell::new(Vec::new()),
         }
     }
 
@@ -125,6 +134,18 @@ impl<'a> RuntimeCtx<'a> {
     pub fn get_temp_ext(&self, idx: usize) -> *const Value {
         let v = self.temp_exts.borrow();
         &**v.get(idx).unwrap() as *const Value
+    }
+
+    pub fn push_temp_ipaddr(&self, ip: CompilerIpAddr) -> usize {
+        let mut v = self.temp_ipaddrs.borrow_mut();
+        let idx = v.len();
+        v.push(Box::new(ip));
+        idx
+    }
+
+    pub fn get_temp_ipaddr(&self, idx: usize) -> *const CompilerIpAddr {
+        let v = self.temp_ipaddrs.borrow();
+        &**v.get(idx).unwrap() as *const CompilerIpAddr
     }
 }
 

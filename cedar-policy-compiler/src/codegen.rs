@@ -532,6 +532,49 @@ impl ExprCompiler {
     // ---- Extension function calls ----
 
     fn emit_extension_call(&mut self, fn_name: &ast::Name, args: &[ast::Expr]) {
+        let name = fn_name.to_string();
+        match (name.as_str(), args.len()) {
+            // IP address
+            ("ip", 1) => { self.emit_expr(&args[0]); self.emit_call_ctx_tag_payload(rt_ext_ip as u64); }
+            ("isIpv4", 1) => { self.emit_expr(&args[0]); self.call_fn2(rt_ext_is_ipv4 as u64); }
+            ("isIpv6", 1) => { self.emit_expr(&args[0]); self.call_fn2(rt_ext_is_ipv6 as u64); }
+            ("isLoopback", 1) => { self.emit_expr(&args[0]); self.call_fn2(rt_ext_is_loopback as u64); }
+            ("isMulticast", 1) => { self.emit_expr(&args[0]); self.call_fn2(rt_ext_is_multicast as u64); }
+            ("isInRange", 2) => self.emit_binary_4arg(&args[0], &args[1], rt_ext_is_in_range as u64),
+            // Decimal
+            ("decimal", 1) => { self.emit_expr(&args[0]); self.emit_call_ctx_tag_payload(rt_ext_decimal as u64); }
+            ("lessThan", 2) => self.emit_binary_4arg(&args[0], &args[1], rt_ext_less_than as u64),
+            ("lessThanOrEqual", 2) => self.emit_binary_4arg(&args[0], &args[1], rt_ext_less_than_or_equal as u64),
+            ("greaterThan", 2) => self.emit_binary_4arg(&args[0], &args[1], rt_ext_greater_than as u64),
+            ("greaterThanOrEqual", 2) => self.emit_binary_4arg(&args[0], &args[1], rt_ext_greater_than_or_equal as u64),
+            // DateTime / Duration
+            ("datetime", 1) => { self.emit_expr(&args[0]); self.emit_call_ctx_tag_payload(rt_ext_datetime as u64); }
+            ("duration", 1) => { self.emit_expr(&args[0]); self.emit_call_ctx_tag_payload(rt_ext_duration as u64); }
+            ("offset", 2) => self.emit_binary_4arg(&args[0], &args[1], rt_ext_offset as u64),
+            ("durationSince", 2) => self.emit_binary_4arg(&args[0], &args[1], rt_ext_duration_since as u64),
+            ("toDate", 1) => { self.emit_expr(&args[0]); self.call_fn2(rt_ext_to_date as u64); }
+            ("toTime", 1) => { self.emit_expr(&args[0]); self.call_fn2(rt_ext_to_time as u64); }
+            ("toMilliseconds", 1) => { self.emit_expr(&args[0]); self.call_fn2(rt_ext_to_milliseconds as u64); }
+            ("toSeconds", 1) => { self.emit_expr(&args[0]); self.call_fn2(rt_ext_to_seconds as u64); }
+            ("toMinutes", 1) => { self.emit_expr(&args[0]); self.call_fn2(rt_ext_to_minutes as u64); }
+            ("toHours", 1) => { self.emit_expr(&args[0]); self.call_fn2(rt_ext_to_hours as u64); }
+            ("toDays", 1) => { self.emit_expr(&args[0]); self.call_fn2(rt_ext_to_days as u64); }
+            // Fallback for unknown extensions
+            _ => self.emit_generic_extension_call(fn_name, args),
+        }
+    }
+
+    /// Call func(ctx, tag, payload) where result is in (x0=tag, x1=payload) and ctx is in x19.
+    fn emit_call_ctx_tag_payload(&mut self, func: u64) {
+        self.buf.mov_reg(X2, X1); // payload -> x2
+        self.buf.mov_reg(X1, X0); // tag -> x1
+        self.buf.mov_reg(X0, X19); // ctx -> x0
+        self.buf.mov_imm64(X8, func);
+        self.buf.blr(X8);
+    }
+
+    /// Generic fallback for unknown extension functions — packs args into stack arrays.
+    fn emit_generic_extension_call(&mut self, fn_name: &ast::Name, args: &[ast::Expr]) {
         let name_str = fn_name.to_string();
         let fn_name_idx = self.intern_extension_name(name_str);
         let count = args.len();
