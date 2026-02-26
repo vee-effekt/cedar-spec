@@ -312,10 +312,13 @@ pub extern "C" fn rt_in(ctx: *const RuntimeCtx, lt: u64, lp: u64, rt: u64, rp: u
         TAG_SET => {
             let set = unsafe { &*(rp as *const BTreeSet<ast::Value>) };
             for val in set.iter() {
-                if let ast::ValueKind::Lit(Literal::EntityUID(ref uid)) = val.value {
-                    if entity_in_uid(ctx, entity_uid, uid) {
-                        return RuntimeValue::bool_val(true);
+                match &val.value {
+                    ast::ValueKind::Lit(Literal::EntityUID(ref uid)) => {
+                        if entity_in_uid(ctx, entity_uid, uid) {
+                            return RuntimeValue::bool_val(true);
+                        }
                     }
+                    _ => return RuntimeValue::error(),
                 }
             }
             RuntimeValue::bool_val(false)

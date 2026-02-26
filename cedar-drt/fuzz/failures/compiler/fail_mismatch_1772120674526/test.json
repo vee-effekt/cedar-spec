@@ -1,0 +1,30 @@
+{
+  "policies": "policy.cedar",
+  "entities": "entities.json",
+  "schema": "",
+  "shouldValidate": false,
+  "requests": [
+    {
+      "description": "Compiler mismatch failure",
+      "principal": {
+        "type": "v23",
+        "id": "\u0006\u0000"
+      },
+      "action": {
+        "type": "Action",
+        "id": "action"
+      },
+      "resource": {
+        "type": "v23",
+        "id": "\u0006\u0000"
+      },
+      "context": {},
+      "validateRequest": false,
+      "decision": "deny",
+      "reason": [],
+      "errors": [
+        ""
+      ]
+    }
+  ]
+}
