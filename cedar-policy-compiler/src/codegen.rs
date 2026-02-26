@@ -324,11 +324,13 @@ impl ExprCompiler {
     // ---- Unary operations ----
 
     fn emit_unary(&mut self, op: UnaryOp, arg: &ast::Expr) {
-        self.emit_expr(arg);
         match op {
-            UnaryOp::Not => self.call_fn2(rt_not as u64),
-            UnaryOp::Neg => self.call_fn2(rt_neg as u64),
-            UnaryOp::IsEmpty => self.call_fn2(rt_is_empty as u64),
+            UnaryOp::Not => self.emit_not_inline(arg),
+            UnaryOp::Neg => self.emit_neg_inline(arg),
+            UnaryOp::IsEmpty => {
+                self.emit_expr(arg);
+                self.call_fn2(rt_is_empty as u64);
+            }
         }
     }
 
@@ -336,12 +338,12 @@ impl ExprCompiler {
 
     fn emit_binary(&mut self, op: BinaryOp, left: &ast::Expr, right: &ast::Expr) {
         match op {
-            BinaryOp::Eq => self.emit_binary_with_ctx(left, right, rt_eq as u64),
-            BinaryOp::Less => self.emit_binary_with_ctx(left, right, rt_less as u64),
-            BinaryOp::LessEq => self.emit_binary_with_ctx(left, right, rt_less_eq as u64),
-            BinaryOp::Add => self.emit_binary_4arg(left, right, rt_add as u64),
-            BinaryOp::Sub => self.emit_binary_4arg(left, right, rt_sub as u64),
-            BinaryOp::Mul => self.emit_binary_4arg(left, right, rt_mul as u64),
+            BinaryOp::Eq => self.emit_eq_inline(left, right),
+            BinaryOp::Less => self.emit_less_inline(left, right),
+            BinaryOp::LessEq => self.emit_less_eq_inline(left, right),
+            BinaryOp::Add => self.emit_add_inline(left, right),
+            BinaryOp::Sub => self.emit_sub_inline(left, right),
+            BinaryOp::Mul => self.emit_mul_inline(left, right),
             BinaryOp::In => self.emit_binary_with_ctx(left, right, rt_in as u64),
             BinaryOp::Contains => self.emit_binary_with_ctx(left, right, rt_contains as u64),
             BinaryOp::ContainsAll => self.emit_binary_4arg(left, right, rt_contains_all as u64),
@@ -400,6 +402,271 @@ impl ExprCompiler {
 
         self.buf.mov_imm64(X8, func);
         self.buf.blr(X8);
+    }
+
+    // ---- Inlined unary operations ----
+
+    /// Inline NOT: bool → bool. Tag check + EOR, no function call.
+    fn emit_not_inline(&mut self, arg: &ast::Expr) {
+        self.emit_expr(arg);
+        // x0 = tag, x1 = payload
+        self.buf.cmp_imm(X0, TAG_BOOL as u32);
+        let br_error = self.buf.emit_bcond_placeholder(COND_NE);
+        // Tag is BOOL — flip payload bit 0
+        self.buf.eor_imm_one(X1, X1);
+        // x0 is still TAG_BOOL from the check
+        let br_done = self.buf.emit_branch_placeholder();
+        // Error
+        let error_label = self.buf.current_offset();
+        self.buf.patch_branch(br_error, error_label);
+        self.emit_error();
+        let done_label = self.buf.current_offset();
+        self.buf.patch_branch(br_done, done_label);
+    }
+
+    /// Inline NEG: long → long. Tag check + SUBS from zero, overflow check.
+    fn emit_neg_inline(&mut self, arg: &ast::Expr) {
+        self.emit_expr(arg);
+        // x0 = tag, x1 = payload
+        self.buf.cmp_imm(X0, TAG_LONG as u32);
+        let br_error_tag = self.buf.emit_bcond_placeholder(COND_NE);
+        // Negate: x1 = 0 - x1, setting flags
+        self.buf.subs_reg(X1, XZR, X1);
+        let br_error_ovf = self.buf.emit_bcond_placeholder(COND_VS);
+        // x0 is still TAG_LONG from the check
+        let br_done = self.buf.emit_branch_placeholder();
+        // Error
+        let error_label = self.buf.current_offset();
+        self.buf.patch_branch(br_error_tag, error_label);
+        self.buf.patch_branch(br_error_ovf, error_label);
+        self.emit_error();
+        let done_label = self.buf.current_offset();
+        self.buf.patch_branch(br_done, done_label);
+    }
+
+    // ---- Inlined binary arithmetic ----
+
+    /// Evaluate binary operands: left → stack, right → (x0,x1), pop left → (x2,x3).
+    fn emit_binary_operands(&mut self, left: &ast::Expr, right: &ast::Expr) {
+        self.emit_expr(left);
+        self.push_result();
+        self.emit_expr(right);
+        self.pop_to_x2_x3();
+        // Now: left=(x2=tag, x3=payload), right=(x0=tag, x1=payload)
+    }
+
+    /// Inline ADD: long + long → long. Tag checks + ADDS with overflow detection.
+    fn emit_add_inline(&mut self, left: &ast::Expr, right: &ast::Expr) {
+        self.emit_binary_operands(left, right);
+        // left=(x2,x3), right=(x0,x1)
+        self.buf.cmp_imm(X2, TAG_LONG as u32);
+        let br_err1 = self.buf.emit_bcond_placeholder(COND_NE);
+        self.buf.cmp_imm(X0, TAG_LONG as u32);
+        let br_err2 = self.buf.emit_bcond_placeholder(COND_NE);
+        // Add payloads with overflow check
+        self.buf.adds_reg(X1, X3, X1);
+        let br_err_ovf = self.buf.emit_bcond_placeholder(COND_VS);
+        self.buf.movz(X0, TAG_LONG as u16, 0);
+        let br_done = self.buf.emit_branch_placeholder();
+        // Error
+        let error_label = self.buf.current_offset();
+        self.buf.patch_branch(br_err1, error_label);
+        self.buf.patch_branch(br_err2, error_label);
+        self.buf.patch_branch(br_err_ovf, error_label);
+        self.emit_error();
+        let done_label = self.buf.current_offset();
+        self.buf.patch_branch(br_done, done_label);
+    }
+
+    /// Inline SUB: long - long → long. Tag checks + SUBS with overflow detection.
+    fn emit_sub_inline(&mut self, left: &ast::Expr, right: &ast::Expr) {
+        self.emit_binary_operands(left, right);
+        self.buf.cmp_imm(X2, TAG_LONG as u32);
+        let br_err1 = self.buf.emit_bcond_placeholder(COND_NE);
+        self.buf.cmp_imm(X0, TAG_LONG as u32);
+        let br_err2 = self.buf.emit_bcond_placeholder(COND_NE);
+        // Subtract: left_payload - right_payload
+        self.buf.subs_reg(X1, X3, X1);
+        let br_err_ovf = self.buf.emit_bcond_placeholder(COND_VS);
+        self.buf.movz(X0, TAG_LONG as u16, 0);
+        let br_done = self.buf.emit_branch_placeholder();
+        // Error
+        let error_label = self.buf.current_offset();
+        self.buf.patch_branch(br_err1, error_label);
+        self.buf.patch_branch(br_err2, error_label);
+        self.buf.patch_branch(br_err_ovf, error_label);
+        self.emit_error();
+        let done_label = self.buf.current_offset();
+        self.buf.patch_branch(br_done, done_label);
+    }
+
+    /// Inline MUL: long * long → long. Tag checks + MUL/SMULH overflow detection.
+    fn emit_mul_inline(&mut self, left: &ast::Expr, right: &ast::Expr) {
+        self.emit_binary_operands(left, right);
+        self.buf.cmp_imm(X2, TAG_LONG as u32);
+        let br_err1 = self.buf.emit_bcond_placeholder(COND_NE);
+        self.buf.cmp_imm(X0, TAG_LONG as u32);
+        let br_err2 = self.buf.emit_bcond_placeholder(COND_NE);
+        // Save right payload (x1 will be overwritten by mul)
+        self.buf.mov_reg(X8, X1);
+        // Low 64 bits of product
+        self.buf.mul_reg(X1, X3, X8);
+        // High 64 bits (signed) for overflow check
+        self.buf.smulh(X9, X3, X8);
+        // Sign-extend the low result to compare with high
+        self.buf.asr_imm(X10, X1, 63);
+        // If high ≠ sign extension of low → overflow
+        self.buf.cmp_reg(X9, X10);
+        let br_err_ovf = self.buf.emit_bcond_placeholder(COND_NE);
+        self.buf.movz(X0, TAG_LONG as u16, 0);
+        let br_done = self.buf.emit_branch_placeholder();
+        // Error
+        let error_label = self.buf.current_offset();
+        self.buf.patch_branch(br_err1, error_label);
+        self.buf.patch_branch(br_err2, error_label);
+        self.buf.patch_branch(br_err_ovf, error_label);
+        self.emit_error();
+        let done_label = self.buf.current_offset();
+        self.buf.patch_branch(br_done, done_label);
+    }
+
+    // ---- Inlined comparison operations (fast path + fallback) ----
+
+    /// Helper: emit the slow-path call for binary ops with ctx.
+    /// Assumes left=(x2,x3), right=(x0,x1). Calls func(ctx, lt, lp, rt, rp).
+    fn emit_slow_call_with_ctx(&mut self, func: u64) {
+        self.buf.mov_reg(X4, X1);   // right payload → x4 (final)
+        self.buf.mov_reg(X5, X0);   // right tag → x5 (temp)
+        self.buf.mov_reg(X1, X2);   // left tag → x1 (final)
+        self.buf.mov_reg(X2, X3);   // left payload → x2 (final)
+        self.buf.mov_reg(X3, X5);   // right tag → x3 (final)
+        self.buf.mov_reg(X0, X19);  // ctx → x0 (final)
+        self.buf.mov_imm64(X8, func);
+        self.buf.blr(X8);
+    }
+
+    /// Inline EQ: fast path for payload-comparable tags, fallback to rt_eq.
+    fn emit_eq_inline(&mut self, left: &ast::Expr, right: &ast::Expr) {
+        self.emit_binary_operands(left, right);
+        // left=(x2,x3), right=(x0,x1)
+
+        // Check if tags are equal
+        self.buf.cmp_reg(X2, X0);
+        let br_diff_tags = self.buf.emit_bcond_placeholder(COND_NE);
+
+        // Same tag — check if payload-comparable
+        self.buf.cmp_imm(X2, TAG_BOOL as u32);
+        let br_cmp1 = self.buf.emit_bcond_placeholder(COND_EQ);
+        self.buf.cmp_imm(X2, TAG_LONG as u32);
+        let br_cmp2 = self.buf.emit_bcond_placeholder(COND_EQ);
+        self.buf.cmp_imm(X2, TAG_DECIMAL as u32);
+        let br_cmp3 = self.buf.emit_bcond_placeholder(COND_EQ);
+        self.buf.cmp_imm(X2, TAG_DATETIME as u32);
+        let br_cmp4 = self.buf.emit_bcond_placeholder(COND_EQ);
+        self.buf.cmp_imm(X2, TAG_DURATION as u32);
+        let br_cmp5 = self.buf.emit_bcond_placeholder(COND_EQ);
+        // Non-payload-comparable same tag (String, Entity, Set, Record, Ext, IpAddr)
+        let br_slow1 = self.buf.emit_branch_placeholder();
+
+        // cmp_payload: compare payloads directly
+        let cmp_payload = self.buf.current_offset();
+        self.buf.patch_branch(br_cmp1, cmp_payload);
+        self.buf.patch_branch(br_cmp2, cmp_payload);
+        self.buf.patch_branch(br_cmp3, cmp_payload);
+        self.buf.patch_branch(br_cmp4, cmp_payload);
+        self.buf.patch_branch(br_cmp5, cmp_payload);
+        self.buf.cmp_reg(X3, X1);
+        self.buf.cset(X1, COND_EQ);
+        self.buf.movz(X0, TAG_BOOL as u16, 0);
+        let br_done1 = self.buf.emit_branch_placeholder();
+
+        // diff_tags: different tags
+        let diff_tags = self.buf.current_offset();
+        self.buf.patch_branch(br_diff_tags, diff_tags);
+        // If either is error, delegate to runtime
+        self.buf.cmp_imm(X2, TAG_ERROR as u32);
+        let br_slow2 = self.buf.emit_bcond_placeholder(COND_EQ);
+        self.buf.cmp_imm(X0, TAG_ERROR as u32);
+        let br_slow3 = self.buf.emit_bcond_placeholder(COND_EQ);
+        // Different non-error tags → false
+        self.buf.movz(X0, TAG_BOOL as u16, 0);
+        self.buf.movz(X1, 0, 0);
+        let br_done2 = self.buf.emit_branch_placeholder();
+
+        // slow_call: delegate to rt_eq
+        let slow_call = self.buf.current_offset();
+        self.buf.patch_branch(br_slow1, slow_call);
+        self.buf.patch_branch(br_slow2, slow_call);
+        self.buf.patch_branch(br_slow3, slow_call);
+        self.emit_slow_call_with_ctx(rt_eq as u64);
+        // Falls through to done
+
+        let done = self.buf.current_offset();
+        self.buf.patch_branch(br_done1, done);
+        self.buf.patch_branch(br_done2, done);
+    }
+
+    /// Inline LESS: fast path for Long and i64-comparable tags, fallback to rt_less.
+    fn emit_less_inline(&mut self, left: &ast::Expr, right: &ast::Expr) {
+        self.emit_less_or_less_eq(left, right, COND_LT, rt_less as u64);
+    }
+
+    /// Inline LESS_EQ: fast path for Long and i64-comparable tags, fallback to rt_less_eq.
+    fn emit_less_eq_inline(&mut self, left: &ast::Expr, right: &ast::Expr) {
+        self.emit_less_or_less_eq(left, right, COND_LE, rt_less_eq as u64);
+    }
+
+    /// Shared implementation for Less and LessEq — only the condition code differs.
+    fn emit_less_or_less_eq(&mut self, left: &ast::Expr, right: &ast::Expr, cond: u32, fallback: u64) {
+        self.emit_binary_operands(left, right);
+        // left=(x2,x3), right=(x0,x1)
+
+        // Fast path: both TAG_LONG (most common)
+        self.buf.cmp_imm(X2, TAG_LONG as u32);
+        let br_check_custom = self.buf.emit_bcond_placeholder(COND_NE);
+        self.buf.cmp_imm(X0, TAG_LONG as u32);
+        let br_check_custom2 = self.buf.emit_bcond_placeholder(COND_NE);
+        // Both Long — signed compare payloads
+        self.buf.cmp_reg(X3, X1);
+        self.buf.cset(X1, cond);
+        self.buf.movz(X0, TAG_BOOL as u16, 0);
+        let br_done1 = self.buf.emit_branch_placeholder();
+
+        // check_custom: check for other i64-comparable types
+        let check_custom = self.buf.current_offset();
+        self.buf.patch_branch(br_check_custom, check_custom);
+        self.buf.patch_branch(br_check_custom2, check_custom);
+        // Tags must match
+        self.buf.cmp_reg(X2, X0);
+        let br_slow1 = self.buf.emit_bcond_placeholder(COND_NE);
+        self.buf.cmp_imm(X2, TAG_DECIMAL as u32);
+        let br_i64_cmp1 = self.buf.emit_bcond_placeholder(COND_EQ);
+        self.buf.cmp_imm(X2, TAG_DATETIME as u32);
+        let br_i64_cmp2 = self.buf.emit_bcond_placeholder(COND_EQ);
+        self.buf.cmp_imm(X2, TAG_DURATION as u32);
+        let br_i64_cmp3 = self.buf.emit_bcond_placeholder(COND_EQ);
+        let br_slow2 = self.buf.emit_branch_placeholder();
+
+        // do_i64_cmp: compare payloads as signed i64
+        let do_i64_cmp = self.buf.current_offset();
+        self.buf.patch_branch(br_i64_cmp1, do_i64_cmp);
+        self.buf.patch_branch(br_i64_cmp2, do_i64_cmp);
+        self.buf.patch_branch(br_i64_cmp3, do_i64_cmp);
+        self.buf.cmp_reg(X3, X1);
+        self.buf.cset(X1, cond);
+        self.buf.movz(X0, TAG_BOOL as u16, 0);
+        let br_done2 = self.buf.emit_branch_placeholder();
+
+        // slow_call: delegate to runtime
+        let slow_call = self.buf.current_offset();
+        self.buf.patch_branch(br_slow1, slow_call);
+        self.buf.patch_branch(br_slow2, slow_call);
+        self.emit_slow_call_with_ctx(fallback);
+        // Falls through to done
+
+        let done = self.buf.current_offset();
+        self.buf.patch_branch(br_done1, done);
+        self.buf.patch_branch(br_done2, done);
     }
 
     // ---- Attribute operations ----

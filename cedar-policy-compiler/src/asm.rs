@@ -26,6 +26,10 @@ pub const SP: u32 = 31;
 // Condition codes for b.cond
 pub const COND_EQ: u32 = 0x0;
 pub const COND_NE: u32 = 0x1;
+pub const COND_VS: u32 = 0x6;
+pub const COND_GE: u32 = 0xA;
+pub const COND_LT: u32 = 0xB;
+pub const COND_LE: u32 = 0xD;
 
 pub struct CodeBuffer {
     code: Vec<u8>,
@@ -257,6 +261,59 @@ impl CodeBuffer {
     /// AND Xd, Xn, Xm
     pub fn and_reg(&mut self, rd: u32, rn: u32, rm: u32) {
         let inst = (1 << 31) | (0b00 << 29) | (0b01010 << 24) | (0b00 << 22) | (0 << 21) | (rm << 16) | (0 << 10) | (rn << 5) | rd;
+        self.emit_u32(inst);
+    }
+
+    /// ADDS Xd, Xn, Xm (add, setting flags for overflow detection)
+    pub fn adds_reg(&mut self, rd: u32, rn: u32, rm: u32) {
+        // sf=1, op=0, S=1, 01011, shift=00, 0, rm, imm6=0, rn, rd
+        let inst = (1 << 31) | (0b01 << 29) | (0b01011 << 24) | (0b00 << 22) | (0 << 21) | (rm << 16) | (0 << 10) | (rn << 5) | rd;
+        self.emit_u32(inst);
+    }
+
+    /// SUBS Xd, Xn, Xm (subtract, setting flags for overflow detection)
+    pub fn subs_reg(&mut self, rd: u32, rn: u32, rm: u32) {
+        // sf=1, op=1, S=1, 01011, shift=00, 0, rm, imm6=0, rn, rd
+        let inst = (1 << 31) | (0b11 << 29) | (0b01011 << 24) | (0b00 << 22) | (0 << 21) | (rm << 16) | (0 << 10) | (rn << 5) | rd;
+        self.emit_u32(inst);
+    }
+
+    /// MUL Xd, Xn, Xm (alias for MADD Xd, Xn, Xm, XZR)
+    pub fn mul_reg(&mut self, rd: u32, rn: u32, rm: u32) {
+        // sf=1, 00, 11011, 000, rm, 0, ra=XZR, rn, rd
+        let inst = (1 << 31) | (0b00 << 29) | (0b11011 << 24) | (0b000 << 21) | (rm << 16) | (0 << 15) | (XZR << 10) | (rn << 5) | rd;
+        self.emit_u32(inst);
+    }
+
+    /// SMULH Xd, Xn, Xm (signed multiply high — upper 64 bits of 128-bit product)
+    pub fn smulh(&mut self, rd: u32, rn: u32, rm: u32) {
+        // sf=1, 00, 11011, 010, rm, 0, 11111, rn, rd
+        let inst = (1 << 31) | (0b00 << 29) | (0b11011 << 24) | (0b010 << 21) | (rm << 16) | (0 << 15) | (0b11111 << 10) | (rn << 5) | rd;
+        self.emit_u32(inst);
+    }
+
+    /// ASR Xd, Xn, #shift (arithmetic shift right, alias for SBFM Xd, Xn, #shift, #63)
+    pub fn asr_imm(&mut self, rd: u32, rn: u32, shift: u32) {
+        debug_assert!(shift < 64);
+        // sf=1, opc=00, 100110, N=1, immr=shift, imms=63, rn, rd
+        let inst = (1 << 31) | (0b00 << 29) | (0b100110 << 23) | (1 << 22) | (shift << 16) | (0b111111 << 10) | (rn << 5) | rd;
+        self.emit_u32(inst);
+    }
+
+    /// EOR Xd, Xn, #1 (XOR with immediate 1 — flip bit 0, for bool NOT)
+    pub fn eor_imm_one(&mut self, rd: u32, rn: u32) {
+        // sf=1, opc=10, 100100, N=1, immr=0, imms=0, rn, rd
+        // Bitmask: N=1, immr=0, imms=0 encodes the value 1 for 64-bit
+        let inst = (1 << 31) | (0b10 << 29) | (0b100100 << 23) | (1 << 22) | (0 << 16) | (0 << 10) | (rn << 5) | rd;
+        self.emit_u32(inst);
+    }
+
+    /// CSET Xd, cond (set Xd to 1 if cond, 0 otherwise)
+    /// Alias for CSINC Xd, XZR, XZR, invert(cond)
+    pub fn cset(&mut self, rd: u32, cond: u32) {
+        let inv_cond = cond ^ 1;
+        // CSINC: sf=1, op=0, S=0, 11010100, Rm=XZR, cond, 01, Rn=XZR, Rd
+        let inst = (1 << 31) | (0 << 30) | (0 << 29) | (0b11010100 << 21) | (XZR << 16) | (inv_cond << 12) | (0b01 << 10) | (XZR << 5) | rd;
         self.emit_u32(inst);
     }
 
