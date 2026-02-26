@@ -10,6 +10,4 @@ To test your implementation, you are encouraged to use the differential testing 
 
 Once your implementation works reasonably well, extensively test it using the differential testing harness. 
 
-Finally, I want to know how much all of this costs. When you get close to compaction, run the /cost skill and output the results to a file.
-
 Good luck!
